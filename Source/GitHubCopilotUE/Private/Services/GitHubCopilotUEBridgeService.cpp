@@ -12,9 +12,11 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/PlatformProcess.h"
+#include "Containers/Ticker.h"
 #include "GenericPlatform/GenericPlatformHttp.h"
 #include "IImageWrapperModule.h"
 #include "IImageWrapper.h"
+#include "Modules/ModuleManager.h"
 
 namespace
 {
@@ -66,6 +68,223 @@ bool IsImageMimeType(const FString& MimeType)
 {
 	return MimeType.StartsWith(TEXT("image/"));
 }
+
+bool ParseJsonObjectString(const FString& JsonText, TSharedPtr<FJsonObject>& OutObject)
+{
+	OutObject.Reset();
+	if (JsonText.IsEmpty())
+	{
+		return false;
+	}
+
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+	return FJsonSerializer::Deserialize(Reader, OutObject) && OutObject.IsValid();
+}
+
+FString MakeReplaySafeToolArguments(const FString& Arguments, int32 MaxLength = TNumericLimits<int32>::Max())
+{
+	const FString Candidate = Arguments.IsEmpty() ? TEXT("{}") : Arguments;
+	TSharedPtr<FJsonObject> ParsedArguments;
+	if (!ParseJsonObjectString(Candidate, ParsedArguments) || Candidate.Len() > MaxLength)
+	{
+		return TEXT("{\"_truncated\":true}");
+	}
+
+	return Candidate;
+}
+
+bool NormalizeToolCallsForReplay(const TSharedPtr<FJsonObject>& Message)
+{
+	if (!Message.IsValid() || !Message->HasField(TEXT("tool_calls")))
+	{
+		return true;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ToolCalls = Message->GetArrayField(TEXT("tool_calls"));
+	for (const TSharedPtr<FJsonValue>& ToolCallValue : ToolCalls)
+	{
+		if (!ToolCallValue.IsValid() || !ToolCallValue->AsObject().IsValid())
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>& ToolCall = ToolCallValue->AsObject();
+		if (!ToolCall->HasField(TEXT("id")) || !ToolCall->HasTypedField<EJson::Object>(TEXT("function")))
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>& Function = ToolCall->GetObjectField(TEXT("function"));
+		if (!Function.IsValid() || !Function->HasField(TEXT("name")))
+		{
+			return false;
+		}
+
+		const FString RawArguments = Function->HasTypedField<EJson::String>(TEXT("arguments"))
+			? Function->GetStringField(TEXT("arguments"))
+			: TEXT("{}");
+		Function->SetStringField(TEXT("arguments"), MakeReplaySafeToolArguments(RawArguments));
+	}
+
+	Message->SetArrayField(TEXT("tool_calls"), ToolCalls);
+	return true;
+}
+
+FString GetMessageRole(const TSharedPtr<FJsonValue>& MsgVal)
+{
+	if (!MsgVal.IsValid() || !MsgVal->AsObject().IsValid())
+	{
+		return FString();
+	}
+
+	const TSharedPtr<FJsonObject>& Msg = MsgVal->AsObject();
+	return Msg->HasField(TEXT("role")) ? Msg->GetStringField(TEXT("role")) : FString();
+}
+
+bool IsResponsesEndpointRequest(const FHttpRequestPtr& HttpReq)
+{
+	return HttpReq.IsValid() && HttpReq->GetURL().Contains(TEXT("/responses"));
+}
+
+FString ExtractResponseContentText(const TArray<TSharedPtr<FJsonValue>>& ContentParts)
+{
+	FString Result;
+
+	for (const TSharedPtr<FJsonValue>& PartVal : ContentParts)
+	{
+		const TSharedPtr<FJsonObject> PartObj = PartVal.IsValid() ? PartVal->AsObject() : nullptr;
+		if (!PartObj.IsValid() || !PartObj->HasField(TEXT("type")))
+		{
+			continue;
+		}
+
+		const FString PartType = PartObj->GetStringField(TEXT("type"));
+		if ((PartType == TEXT("output_text") || PartType == TEXT("text") || PartType == TEXT("input_text")) && PartObj->HasField(TEXT("text")))
+		{
+			Result += PartObj->GetStringField(TEXT("text"));
+		}
+		else if (PartType == TEXT("refusal") && PartObj->HasField(TEXT("refusal")))
+		{
+			Result += PartObj->GetStringField(TEXT("refusal"));
+		}
+	}
+
+	return Result;
+}
+
+bool ParseResponsesMessage(
+	const TSharedPtr<FJsonObject>& Json,
+	TSharedPtr<FJsonObject>& OutMessage,
+	FString& OutFinishReason,
+	FString& OutPrefixContent,
+	int32& OutOutputCount,
+	FString& OutError)
+{
+	OutMessage.Reset();
+	OutFinishReason.Reset();
+	OutPrefixContent.Reset();
+	OutOutputCount = 0;
+	OutError.Reset();
+
+	FString AggregatedText;
+	if (Json->HasField(TEXT("output_text")))
+	{
+		AggregatedText = Json->GetStringField(TEXT("output_text"));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> NormalizedToolCalls;
+	const TArray<TSharedPtr<FJsonValue>>* OutputItems = nullptr;
+	if (Json->TryGetArrayField(TEXT("output"), OutputItems) && OutputItems != nullptr)
+	{
+		OutOutputCount = OutputItems->Num();
+
+		for (const TSharedPtr<FJsonValue>& ItemVal : *OutputItems)
+		{
+			const TSharedPtr<FJsonObject> ItemObj = ItemVal.IsValid() ? ItemVal->AsObject() : nullptr;
+			if (!ItemObj.IsValid() || !ItemObj->HasField(TEXT("type")))
+			{
+				continue;
+			}
+
+			const FString ItemType = ItemObj->GetStringField(TEXT("type"));
+			if (ItemType == TEXT("function_call"))
+			{
+				const FString ToolName = ItemObj->HasField(TEXT("name")) ? ItemObj->GetStringField(TEXT("name")) : TEXT("");
+				const FString ToolArgs = ItemObj->HasField(TEXT("arguments")) ? ItemObj->GetStringField(TEXT("arguments")) : TEXT("{}");
+
+				FString ToolCallId;
+				if (ItemObj->HasField(TEXT("call_id")))
+				{
+					ToolCallId = ItemObj->GetStringField(TEXT("call_id"));
+				}
+				else if (ItemObj->HasField(TEXT("id")))
+				{
+					ToolCallId = ItemObj->GetStringField(TEXT("id"));
+				}
+				else
+				{
+					ToolCallId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+				}
+
+				TSharedPtr<FJsonObject> FunctionObj = MakeShareable(new FJsonObject);
+				FunctionObj->SetStringField(TEXT("name"), ToolName);
+				FunctionObj->SetStringField(TEXT("arguments"), ToolArgs);
+
+				TSharedPtr<FJsonObject> ToolCallObj = MakeShareable(new FJsonObject);
+				ToolCallObj->SetStringField(TEXT("id"), ToolCallId);
+				ToolCallObj->SetStringField(TEXT("type"), TEXT("function"));
+				ToolCallObj->SetObjectField(TEXT("function"), FunctionObj);
+				NormalizedToolCalls.Add(MakeShareable(new FJsonValueObject(ToolCallObj)));
+			}
+			else if (ItemType == TEXT("message") && ItemObj->HasTypedField<EJson::Array>(TEXT("content")))
+			{
+				AggregatedText += ExtractResponseContentText(ItemObj->GetArrayField(TEXT("content")));
+			}
+			else if ((ItemType == TEXT("output_text") || ItemType == TEXT("text")) && ItemObj->HasField(TEXT("text")))
+			{
+				AggregatedText += ItemObj->GetStringField(TEXT("text"));
+			}
+		}
+	}
+
+	if (NormalizedToolCalls.Num() > 0)
+	{
+		OutMessage = MakeShareable(new FJsonObject);
+		OutMessage->SetStringField(TEXT("role"), TEXT("assistant"));
+		OutMessage->SetArrayField(TEXT("tool_calls"), NormalizedToolCalls);
+		OutPrefixContent = AggregatedText;
+		OutFinishReason = TEXT("tool_calls");
+		return true;
+	}
+
+	if (Json->HasTypedField<EJson::Object>(TEXT("incomplete_details")))
+	{
+		const TSharedPtr<FJsonObject> IncompleteDetails = Json->GetObjectField(TEXT("incomplete_details"));
+		if (IncompleteDetails.IsValid() && IncompleteDetails->HasField(TEXT("reason"))
+			&& IncompleteDetails->GetStringField(TEXT("reason")) == TEXT("max_output_tokens"))
+		{
+			OutFinishReason = TEXT("length");
+		}
+	}
+
+	if (OutFinishReason.IsEmpty())
+	{
+		OutFinishReason = TEXT("stop");
+	}
+
+	if (AggregatedText.IsEmpty())
+	{
+		OutError = OutOutputCount > 0
+			? TEXT("/responses reply had output items but no text or function calls")
+			: TEXT("/responses reply had no output items, text, or function calls");
+		return false;
+	}
+
+	OutMessage = MakeShareable(new FJsonObject);
+	OutMessage->SetStringField(TEXT("role"), TEXT("assistant"));
+	OutMessage->SetStringField(TEXT("content"), AggregatedText);
+	return true;
+}
 } // namespace
 
 FGitHubCopilotUEBridgeService::FGitHubCopilotUEBridgeService()
@@ -102,6 +321,9 @@ void FGitHubCopilotUEBridgeService::Shutdown()
 	SaveConversationCache();
 	PendingRequestTimestamps.Empty();
 	NoResponseRetryCounts.Empty();
+	LengthContinuationCounts.Empty();
+	AccumulatedLengthContent.Empty();
+	LengthContinuationBaseMessageCounts.Empty();
 }
 
 // ============================================================================
@@ -119,6 +341,7 @@ void FGitHubCopilotUEBridgeService::SaveTokenCache()
 	Json->SetStringField(TEXT("access_token"), GitHubAccessToken);
 	Json->SetStringField(TEXT("username"), GitHubUsername);
 	Json->SetStringField(TEXT("active_model"), ActiveModelId);
+	Json->SetStringField(TEXT("reasoning_effort"), ReasoningEffort);
 	Json->SetStringField(TEXT("api_endpoint"), CopilotAPIBase);
 	Json->SetStringField(TEXT("sku"), CopilotSku);
 
@@ -145,6 +368,7 @@ void FGitHubCopilotUEBridgeService::LoadTokenCache()
 		GitHubAccessToken = Json->GetStringField(TEXT("access_token"));
 		GitHubUsername = Json->GetStringField(TEXT("username"));
 		ActiveModelId = Json->HasField(TEXT("active_model")) ? Json->GetStringField(TEXT("active_model")) : TEXT("");
+		ReasoningEffort = Json->HasField(TEXT("reasoning_effort")) ? Json->GetStringField(TEXT("reasoning_effort")) : TEXT("medium");
 		CopilotAPIBase = Json->HasField(TEXT("api_endpoint")) ? Json->GetStringField(TEXT("api_endpoint")) : TEXT("");
 		CopilotSku = Json->HasField(TEXT("sku")) ? Json->GetStringField(TEXT("sku")) : TEXT("");
 		if (!GitHubAccessToken.IsEmpty())
@@ -1294,6 +1518,9 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 		constexpr int32 MaxOldAssistantChars = 6000;
 		constexpr int32 MaxPayloadChars = 400000;     // ~400KB — models support 128K+ tokens
 		constexpr int32 KeepRecentMessages = 40;       // recent window where content is kept verbatim
+		constexpr int32 MinMessagesToKeep = KeepRecentMessages;
+
+		SanitizeConversationMessages(ConvoMessages);
 
 		int32 RecentStart = FMath::Max(1, ConvoMessages.Num() - KeepRecentMessages);
 
@@ -1374,12 +1601,10 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 							TSharedPtr<FJsonObject> Func = TC->AsObject()->GetObjectField(TEXT("function"));
 							if (Func.IsValid())
 							{
-								FString Args = Func->GetStringField(TEXT("arguments"));
-								if (Args.Len() > 500)
-								{
-									// Replace with valid empty JSON — truncated JSON breaks the API
-									Func->SetStringField(TEXT("arguments"), TEXT("{}"));
-								}
+								const FString RawArgs = Func->HasTypedField<EJson::String>(TEXT("arguments"))
+									? Func->GetStringField(TEXT("arguments"))
+									: TEXT("{}");
+								Func->SetStringField(TEXT("arguments"), MakeReplaySafeToolArguments(RawArgs, 500));
 							}
 						}
 					}
@@ -1388,111 +1613,15 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 			// NOTE: user messages are NEVER truncated — they contain the context
 		}
 
-		// Payload estimator
-		auto EstimatePayloadSize = [](const TArray<TSharedPtr<FJsonValue>>& Msgs) -> int32
-		{
-			int32 Total = 0;
-			for (const TSharedPtr<FJsonValue>& MsgVal : Msgs)
-			{
-				if (!MsgVal.IsValid() || !MsgVal->AsObject().IsValid()) continue;
-				const TSharedPtr<FJsonObject>& MsgObj = MsgVal->AsObject();
-
-				if (MsgObj->HasTypedField<EJson::String>(TEXT("content")))
-				{
-					Total += MsgObj->GetStringField(TEXT("content")).Len();
-				}
-				else if (MsgObj->HasTypedField<EJson::Array>(TEXT("content")))
-				{
-					for (const auto& Part : MsgObj->GetArrayField(TEXT("content")))
-					{
-						if (Part.IsValid() && Part->AsObject().IsValid())
-						{
-							const TSharedPtr<FJsonObject>& P = Part->AsObject();
-							if (P->HasField(TEXT("text")))
-								Total += P->GetStringField(TEXT("text")).Len();
-							if (P->HasField(TEXT("image_url")))
-							{
-								TSharedPtr<FJsonObject> ImgObj = P->GetObjectField(TEXT("image_url"));
-								if (ImgObj.IsValid() && ImgObj->HasField(TEXT("url")))
-									Total += ImgObj->GetStringField(TEXT("url")).Len();
-							}
-						}
-					}
-				}
-				if (MsgObj->HasField(TEXT("tool_calls")))
-				{
-					for (const auto& TC : MsgObj->GetArrayField(TEXT("tool_calls")))
-					{
-						if (TC.IsValid() && TC->AsObject().IsValid())
-						{
-							TSharedPtr<FJsonObject> Func = TC->AsObject()->GetObjectField(TEXT("function"));
-							if (Func.IsValid())
-								Total += Func->GetStringField(TEXT("arguments")).Len() + 50;
-						}
-					}
-				}
-				Total += 100; // JSON overhead per message
-			}
-			return Total;
-		};
-
-		// Pass 3: If still over budget, drop OLD messages — but NEVER user messages.
-		// Priority: drop tool results first, then assistant messages, then as last
-		// resort drop tool_calls+tool pairs. User messages are always preserved.
-		int32 PayloadEstimate = EstimatePayloadSize(ConvoMessages);
-		if (PayloadEstimate > MaxPayloadChars && ConvoMessages.Num() > 4)
+		int32 PayloadEstimate = EstimateConversationPayloadChars(ConvoMessages);
+		if (PayloadEstimate > MaxPayloadChars && ConvoMessages.Num() > MinMessagesToKeep)
 		{
 			Log(FString::Printf(TEXT("BridgeService: [PRUNE] Payload %d chars (%d msgs) — need to trim"),
 				PayloadEstimate, ConvoMessages.Num()));
 
-			// First pass: drop old tool result messages (role=tool) from before recent window
-			// Must also drop the corresponding assistant tool_calls message to keep valid structure
-			for (int32 i = 1; i < RecentStart && PayloadEstimate > MaxPayloadChars; ++i)
-			{
-				TSharedPtr<FJsonObject> Msg = ConvoMessages[i]->AsObject();
-				if (!Msg.IsValid()) continue;
-				FString Role = Msg->GetStringField(TEXT("role"));
-				if (Role == TEXT("tool"))
-				{
-					// Replace bulky tool result with a tiny summary
-					Msg->SetStringField(TEXT("content"), TEXT("[tool output removed for space]"));
-					PayloadEstimate = EstimatePayloadSize(ConvoMessages);
-				}
-			}
-
-			// Second pass: truncate old assistant messages more aggressively
-			for (int32 i = 1; i < RecentStart && PayloadEstimate > MaxPayloadChars; ++i)
-			{
-				TSharedPtr<FJsonObject> Msg = ConvoMessages[i]->AsObject();
-				if (!Msg.IsValid()) continue;
-				FString Role = Msg->GetStringField(TEXT("role"));
-				if (Role == TEXT("assistant") && Msg->HasTypedField<EJson::String>(TEXT("content")))
-				{
-					FString Content = Msg->GetStringField(TEXT("content"));
-					if (Content.Len() > 500)
-					{
-						Msg->SetStringField(TEXT("content"), Content.Left(500) + TEXT("\n...[trimmed for space]"));
-						PayloadEstimate = EstimatePayloadSize(ConvoMessages);
-					}
-				}
-			}
-
-			// Last resort: drop non-user messages entirely from oldest end
-			// CRITICAL: Never drop user messages — they contain the conversation context
-			for (int32 i = 1; i < ConvoMessages.Num() - 4 && PayloadEstimate > MaxPayloadChars; )
-			{
-				TSharedPtr<FJsonObject> Msg = ConvoMessages[i]->AsObject();
-				if (!Msg.IsValid()) { ++i; continue; }
-				FString Role = Msg->GetStringField(TEXT("role"));
-				if (Role == TEXT("user"))
-				{
-					++i; // SKIP — never remove user messages
-					continue;
-				}
-				ConvoMessages.RemoveAt(i);
-				PayloadEstimate = EstimatePayloadSize(ConvoMessages);
-				// Don't increment i — next element shifted into this position
-			}
+			PruneConversationToPayloadBudget(ConvoMessages, MaxPayloadChars, MinMessagesToKeep);
+			PayloadEstimate = EstimateConversationPayloadChars(ConvoMessages);
+			SanitizeConversationMessages(ConvoMessages);
 
 			Log(FString::Printf(TEXT("BridgeService: [PRUNE] Trimmed to %d messages (%d chars)"),
 				ConvoMessages.Num(), PayloadEstimate));
@@ -1566,13 +1695,58 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 					InputText += FString::Printf(TEXT("[Tool Result: %s]\n%s\n\n"), *ToolName, *Content);
 				}
 			}
+
+			if (Role == TEXT("assistant") && Msg->HasTypedField<EJson::Array>(TEXT("tool_calls")))
+			{
+				const TArray<TSharedPtr<FJsonValue>>& ToolCalls = Msg->GetArrayField(TEXT("tool_calls"));
+				for (const TSharedPtr<FJsonValue>& ToolCallVal : ToolCalls)
+				{
+					const TSharedPtr<FJsonObject> ToolCallObj = ToolCallVal.IsValid() ? ToolCallVal->AsObject() : nullptr;
+					if (!ToolCallObj.IsValid() || !ToolCallObj->HasTypedField<EJson::Object>(TEXT("function")))
+					{
+						continue;
+					}
+
+					const TSharedPtr<FJsonObject> FunctionObj = ToolCallObj->GetObjectField(TEXT("function"));
+					if (!FunctionObj.IsValid())
+					{
+						continue;
+					}
+
+					const FString ToolName = FunctionObj->HasField(TEXT("name")) ? FunctionObj->GetStringField(TEXT("name")) : TEXT("tool");
+					const FString ToolArgs = FunctionObj->HasField(TEXT("arguments")) ? FunctionObj->GetStringField(TEXT("arguments")) : TEXT("{}");
+					InputText += FString::Printf(TEXT("[Assistant Tool Call: %s]\n%s\n\n"), *ToolName, *ToolArgs);
+				}
+			}
 		}
 
 		JsonBody->SetStringField(TEXT("input"), InputText);
 
 		if (bAllowToolCalls)
 		{
-			TArray<TSharedPtr<FJsonValue>> Tools = FGitHubCopilotUEToolExecutor::BuildToolDefinitions();
+			TArray<TSharedPtr<FJsonValue>> Tools = FGitHubCopilotUEToolExecutor::BuildToolDefinitions(true);
+			TArray<FString> ToolErrors;
+			if (!FGitHubCopilotUEToolExecutor::ValidateToolDefinitions(Tools, true, ToolErrors))
+			{
+				PendingRequestTimestamps.Remove(Request.RequestId);
+				ToolCallIterations.Remove(Request.RequestId);
+				ForcedFinalResponseRequestIds.Remove(Request.RequestId);
+				NoResponseRetryCounts.Remove(Request.RequestId);
+
+				for (const FString& ToolError : ToolErrors)
+				{
+					Log(FString::Printf(TEXT("BridgeService: Tool schema validation error (/responses): %s"), *ToolError));
+				}
+
+				FCopilotResponse ErrorResponse;
+				ErrorResponse.RequestId = Request.RequestId;
+				ErrorResponse.Timestamp = FDateTime::Now().ToString();
+				ErrorResponse.ResultStatus = ECopilotResultStatus::Failure;
+				ErrorResponse.ErrorMessage = FString::Printf(TEXT("Plugin tool schema validation failed before /responses request: %s"), *FString::Join(ToolErrors, TEXT(" | ")).Left(500));
+				ErrorResponse.bSuccess = false;
+				OnResponseReceived.Broadcast(ErrorResponse);
+				return;
+			}
 			JsonBody->SetArrayField(TEXT("tools"), Tools);
 			Log(FString::Printf(TEXT("BridgeService: [/responses] Sending %d tools, input=%d chars, model=%s"), Tools.Num(), InputText.Len(), *ModelToUse));
 		}
@@ -1609,11 +1783,36 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 				Log(FString::Printf(TEXT("BridgeService: Using model-reported max_output_tokens=%d for %s"), MaxOutputTokens, *ModelToUse));
 			}
 		}
-		JsonBody->SetNumberField(TEXT("max_tokens"), MaxOutputTokens);
+		const bool bUseMaxCompletionTokens = MaxCompletionTokenRequestIds.Contains(Request.RequestId);
+		const TCHAR* TokenFieldName = bUseMaxCompletionTokens ? TEXT("max_completion_tokens") : TEXT("max_tokens");
+		JsonBody->SetNumberField(TokenFieldName, MaxOutputTokens);
+		Log(FString::Printf(TEXT("BridgeService: Using %s=%d for %s"), TokenFieldName, MaxOutputTokens, *ModelToUse));
 
 		if (bAllowToolCalls)
 		{
-			TArray<TSharedPtr<FJsonValue>> Tools = FGitHubCopilotUEToolExecutor::BuildToolDefinitions();
+			TArray<TSharedPtr<FJsonValue>> Tools = FGitHubCopilotUEToolExecutor::BuildToolDefinitions(false);
+			TArray<FString> ToolErrors;
+			if (!FGitHubCopilotUEToolExecutor::ValidateToolDefinitions(Tools, false, ToolErrors))
+			{
+				PendingRequestTimestamps.Remove(Request.RequestId);
+				ToolCallIterations.Remove(Request.RequestId);
+				ForcedFinalResponseRequestIds.Remove(Request.RequestId);
+				NoResponseRetryCounts.Remove(Request.RequestId);
+
+				for (const FString& ToolError : ToolErrors)
+				{
+					Log(FString::Printf(TEXT("BridgeService: Tool schema validation error (/chat/completions): %s"), *ToolError));
+				}
+
+				FCopilotResponse ErrorResponse;
+				ErrorResponse.RequestId = Request.RequestId;
+				ErrorResponse.Timestamp = FDateTime::Now().ToString();
+				ErrorResponse.ResultStatus = ECopilotResultStatus::Failure;
+				ErrorResponse.ErrorMessage = FString::Printf(TEXT("Plugin tool schema validation failed before /chat/completions request: %s"), *FString::Join(ToolErrors, TEXT(" | ")).Left(500));
+				ErrorResponse.bSuccess = false;
+				OnResponseReceived.Broadcast(ErrorResponse);
+				return;
+			}
 			JsonBody->SetArrayField(TEXT("tools"), Tools);
 			JsonBody->SetStringField(TEXT("tool_choice"), TEXT("auto"));
 			Log(FString::Printf(TEXT("BridgeService: Sending %d tools, %d messages, model=%s"), Tools.Num(), ConvoMessages.Num(), *ModelToUse));
@@ -1626,8 +1825,7 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 	}
 
 	FString RequestBody;
-	TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
-		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&RequestBody);
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&RequestBody);
 	FJsonSerializer::Serialize(JsonBody.ToSharedRef(), Writer);
 	Writer->Close();
 
@@ -1756,6 +1954,8 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 
 	if (!EHttpResponseCodes::IsOk(StatusCode))
 	{
+		const bool bAllowToolCalls = !ForcedFinalResponseRequestIds.Contains(RequestId);
+		const bool bResponsesFormat = IsResponsesEndpointRequest(HttpReq);
 		PendingRequestTimestamps.Remove(RequestId);
 		// Don't remove ActiveConversations — conversation persists across errors for retry
 		ToolCallIterations.Remove(RequestId);
@@ -1783,6 +1983,46 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 		{
 			// Check for specific error codes like unsupported_api_for_model
 			Log(FString::Printf(TEXT("BridgeService: Bad request — check model compatibility: %s"), *Body.Left(300)));
+
+			const bool bUnsupportedMaxTokens = !bResponsesFormat
+				&& !MaxCompletionTokenRequestIds.Contains(RequestId)
+				&& Body.Contains(TEXT("Unsupported parameter: 'max_tokens'"), ESearchCase::CaseSensitive)
+				&& Body.Contains(TEXT("max_completion_tokens"), ESearchCase::CaseSensitive);
+			if (bUnsupportedMaxTokens)
+			{
+				MaxCompletionTokenRequestIds.Add(RequestId);
+				PendingRequestTimestamps.Add(RequestId, FPlatformTime::Seconds());
+				Log(FString::Printf(TEXT("BridgeService: Retrying %s with max_completion_tokens for model compatibility"), *RequestId));
+
+				FCopilotRequest RetryRequest;
+				RetryRequest.RequestId = RequestId;
+				RetryRequest.ConversationId = ConversationId;
+				RetryRequest.CommandType = ECopilotCommandType::Ask;
+				SendChatCompletion(RetryRequest, bAllowToolCalls);
+				return;
+			}
+
+			const bool bInvalidToolChain = Body.Contains(TEXT("tool_result"), ESearchCase::IgnoreCase)
+				|| Body.Contains(TEXT("tool_use"), ESearchCase::IgnoreCase)
+				|| Body.Contains(TEXT("tool_call_id"), ESearchCase::IgnoreCase);
+			if (Body.Contains(TEXT("tools[0].name")))
+			{
+				Log(TEXT("BridgeService: Server rejected tool definitions because /responses expects top-level tool.name/description/parameters fields."));
+			}
+			if (Body.Contains(TEXT("invalid_function_parameters")) || Body.Contains(TEXT("array schema missing items")) || Body.Contains(TEXT("missing items")))
+			{
+				Log(TEXT("BridgeService: Server rejected a tool parameter schema. Array-typed properties must include an items.type schema."));
+			}
+			if (bInvalidToolChain)
+			{
+				Log(FString::Printf(TEXT("BridgeService: Clearing invalid conversation state for %s after tool-chain HTTP 400"), *ConversationId));
+				ClearConversation(ConversationId);
+				if (CurrentConversationId == ConversationId)
+				{
+					CachedChatTranscript.Empty();
+				}
+				Response.ErrorMessage += TEXT(" Conversation history was reset because stored tool-call state was invalid. Retry the request.");
+			}
 		}
 
 		OnResponseReceived.Broadcast(Response);
@@ -1798,149 +2038,164 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 		ToolCallIterations.Remove(RequestId);
 		ForcedFinalResponseRequestIds.Remove(RequestId);
 		NoResponseRetryCounts.Remove(RequestId);
+		MaxCompletionTokenRequestIds.Remove(RequestId);
 		Response.ResultStatus = ECopilotResultStatus::Failure;
 		Response.ErrorMessage = TEXT("Failed to parse Copilot response JSON");
 		OnResponseReceived.Broadcast(Response);
 		return;
 	}
 
-	// Extract the assistant's message
-	// IMPORTANT: Copilot API may return MULTIPLE choices for Claude models:
-	//   choices[0] = content (thinking text), no tool_calls
-	//   choices[1] = tool_calls, no content
-	// We need to find the choice that has tool_calls, OR merge them.
-	const TArray<TSharedPtr<FJsonValue>>* Choices;
-	if (!Json->TryGetArrayField(TEXT("choices"), Choices) || Choices->Num() == 0)
-	{
-		PendingRequestTimestamps.Remove(RequestId);
-		ToolCallIterations.Remove(RequestId);
-		ForcedFinalResponseRequestIds.Remove(RequestId);
-		NoResponseRetryCounts.Remove(RequestId);
-		Response.ResultStatus = ECopilotResultStatus::Failure;
-		Response.ErrorMessage = TEXT("No choices in Copilot response");
-		OnResponseReceived.Broadcast(Response);
-		return;
-	}
-
-	// Scan all choices to find content and tool_calls (may be in different choices)
-	TSharedPtr<FJsonObject> ContentMessage;     // choice with text content
-	TSharedPtr<FJsonObject> ToolCallMessage;    // choice with tool_calls
-	TSharedPtr<FJsonObject> ToolCallChoice;     // the choice object containing tool_calls
+	const bool bResponsesFormat = IsResponsesEndpointRequest(HttpReq);
+	TSharedPtr<FJsonObject> Message;
 	FString FinishReason;
+	FString PrefixContent;
+	int32 MessageVariantCount = 0;
+	FString MessageVariantLabel = bResponsesFormat ? TEXT("outputs") : TEXT("choices");
 
-	for (const TSharedPtr<FJsonValue>& ChoiceVal : *Choices)
+	if (bResponsesFormat)
 	{
-		TSharedPtr<FJsonObject> ChoiceObj = ChoiceVal->AsObject();
-		if (!ChoiceObj.IsValid()) continue;
-
-		TSharedPtr<FJsonObject> Msg = ChoiceObj->GetObjectField(TEXT("message"));
-		if (!Msg.IsValid()) continue;
-
-		FString FR = ChoiceObj->GetStringField(TEXT("finish_reason"));
-
-		if (Msg->HasField(TEXT("tool_calls")))
+		FString ParseError;
+		if (!ParseResponsesMessage(Json, Message, FinishReason, PrefixContent, MessageVariantCount, ParseError))
 		{
-			ToolCallMessage = Msg;
-			ToolCallChoice = ChoiceObj;
-			FinishReason = FR;
+			PendingRequestTimestamps.Remove(RequestId);
+			ToolCallIterations.Remove(RequestId);
+			ForcedFinalResponseRequestIds.Remove(RequestId);
+			NoResponseRetryCounts.Remove(RequestId);
+			MaxCompletionTokenRequestIds.Remove(RequestId);
+			Response.ResultStatus = ECopilotResultStatus::Failure;
+			Response.ErrorMessage = FString::Printf(TEXT("Failed to parse /responses payload: %s"), *ParseError);
+			Log(FString::Printf(TEXT("BridgeService: /responses parse failure for %s: %s"), *RequestId, *ParseError));
+			OnResponseReceived.Broadcast(Response);
+			return;
 		}
 
-		FString Content = Msg->HasField(TEXT("content")) ? Msg->GetStringField(TEXT("content")) : TEXT("");
-		if (!Content.IsEmpty() && !ContentMessage.IsValid())
+		if (!PrefixContent.IsEmpty() && Message.IsValid() && Message->HasField(TEXT("tool_calls")))
 		{
-			ContentMessage = Msg;
-			if (FinishReason.IsEmpty())
+			FString Display = PrefixContent.Len() > 300 ? PrefixContent.Left(300) + TEXT("...") : PrefixContent;
+			Display.ReplaceInline(TEXT("\n"), TEXT(" "));
+			OnToolActivity.Broadcast(FString::Printf(TEXT("Thinking: %s"), *Display));
+		}
+	}
+	else
+	{
+		const TArray<TSharedPtr<FJsonValue>>* Choices;
+		if (!Json->TryGetArrayField(TEXT("choices"), Choices) || Choices->Num() == 0)
+		{
+			PendingRequestTimestamps.Remove(RequestId);
+			ToolCallIterations.Remove(RequestId);
+			ForcedFinalResponseRequestIds.Remove(RequestId);
+			NoResponseRetryCounts.Remove(RequestId);
+			MaxCompletionTokenRequestIds.Remove(RequestId);
+			Response.ResultStatus = ECopilotResultStatus::Failure;
+			Response.ErrorMessage = TEXT("No choices in Copilot response");
+			OnResponseReceived.Broadcast(Response);
+			return;
+		}
+
+		MessageVariantCount = Choices->Num();
+
+		TSharedPtr<FJsonObject> ContentMessage;
+		TSharedPtr<FJsonObject> ToolCallMessage;
+
+		for (const TSharedPtr<FJsonValue>& ChoiceVal : *Choices)
+		{
+			TSharedPtr<FJsonObject> ChoiceObj = ChoiceVal->AsObject();
+			if (!ChoiceObj.IsValid()) continue;
+
+			TSharedPtr<FJsonObject> Msg = ChoiceObj->GetObjectField(TEXT("message"));
+			if (!Msg.IsValid()) continue;
+
+			FString FR = ChoiceObj->GetStringField(TEXT("finish_reason"));
+
+			if (Msg->HasField(TEXT("tool_calls")))
 			{
+				ToolCallMessage = Msg;
 				FinishReason = FR;
 			}
-		}
-	}
 
-	// Use the tool_call message if found, otherwise use the content message
-	TSharedPtr<FJsonObject> Message = ToolCallMessage.IsValid() ? ToolCallMessage : ContentMessage;
-	if (!FinishReason.IsEmpty() && FinishReason == TEXT("tool_calls") && ToolCallMessage.IsValid())
-	{
-		Message = ToolCallMessage;
-	}
-	else if (!Message.IsValid() && Choices->Num() > 0)
-	{
-		// Fallback: just use first choice
-		TSharedPtr<FJsonObject> FirstChoice = (*Choices)[0]->AsObject();
-		if (FirstChoice.IsValid())
-		{
-			Message = FirstChoice->GetObjectField(TEXT("message"));
-			FinishReason = FirstChoice->GetStringField(TEXT("finish_reason"));
-		}
-	}
-
-	// Capture content text from ContentMessage even if we're using ToolCallMessage
-	FString PrefixContent;
-	if (ContentMessage.IsValid() && ContentMessage != Message)
-	{
-		PrefixContent = ContentMessage->HasField(TEXT("content")) ? ContentMessage->GetStringField(TEXT("content")) : TEXT("");
-	}
-
-	// ── Extract and broadcast thinking/reasoning content ──
-	// Models may return thinking in several formats:
-	//   1. "reasoning_content" field on the message (DeepSeek, some OpenAI)
-	//   2. content as array with {type:"thinking", thinking:"..."} parts (Claude)
-	//   3. Separate choice with only content (Claude split-choice) — already captured as PrefixContent
-	for (const TSharedPtr<FJsonValue>& ChoiceVal : *Choices)
-	{
-		TSharedPtr<FJsonObject> ChoiceObj = ChoiceVal->AsObject();
-		if (!ChoiceObj.IsValid()) continue;
-		TSharedPtr<FJsonObject> Msg = ChoiceObj->GetObjectField(TEXT("message"));
-		if (!Msg.IsValid()) continue;
-
-		// Format 1: reasoning_content field
-		if (Msg->HasField(TEXT("reasoning_content")))
-		{
-			FString Reasoning = Msg->GetStringField(TEXT("reasoning_content"));
-			if (!Reasoning.IsEmpty())
+			FString Content = Msg->HasField(TEXT("content")) ? Msg->GetStringField(TEXT("content")) : TEXT("");
+			if (!Content.IsEmpty() && !ContentMessage.IsValid())
 			{
-				// Truncate very long reasoning for display
-				FString Display = Reasoning.Len() > 300 ? Reasoning.Left(300) + TEXT("...") : Reasoning;
-				Display.ReplaceInline(TEXT("\n"), TEXT(" "));
-				OnToolActivity.Broadcast(FString::Printf(TEXT("Thinking: %s"), *Display));
+				ContentMessage = Msg;
+				if (FinishReason.IsEmpty())
+				{
+					FinishReason = FR;
+				}
 			}
 		}
 
-		// Format 2: content as array with thinking parts
-		if (Msg->HasTypedField<EJson::Array>(TEXT("content")))
+		Message = ToolCallMessage.IsValid() ? ToolCallMessage : ContentMessage;
+		if (!FinishReason.IsEmpty() && FinishReason == TEXT("tool_calls") && ToolCallMessage.IsValid())
 		{
-			const TArray<TSharedPtr<FJsonValue>>& ContentParts = Msg->GetArrayField(TEXT("content"));
-			for (const auto& PartVal : ContentParts)
+			Message = ToolCallMessage;
+		}
+		else if (!Message.IsValid() && Choices->Num() > 0)
+		{
+			TSharedPtr<FJsonObject> FirstChoice = (*Choices)[0]->AsObject();
+			if (FirstChoice.IsValid())
 			{
-				TSharedPtr<FJsonObject> Part = PartVal->AsObject();
-				if (!Part.IsValid()) continue;
-				FString PartType = Part->HasField(TEXT("type")) ? Part->GetStringField(TEXT("type")) : TEXT("");
-				if (PartType == TEXT("thinking") && Part->HasField(TEXT("thinking")))
+				Message = FirstChoice->GetObjectField(TEXT("message"));
+				FinishReason = FirstChoice->GetStringField(TEXT("finish_reason"));
+			}
+		}
+
+		if (ContentMessage.IsValid() && ContentMessage != Message)
+		{
+			PrefixContent = ContentMessage->HasField(TEXT("content")) ? ContentMessage->GetStringField(TEXT("content")) : TEXT("");
+		}
+
+		for (const TSharedPtr<FJsonValue>& ChoiceVal : *Choices)
+		{
+			TSharedPtr<FJsonObject> ChoiceObj = ChoiceVal->AsObject();
+			if (!ChoiceObj.IsValid()) continue;
+			TSharedPtr<FJsonObject> Msg = ChoiceObj->GetObjectField(TEXT("message"));
+			if (!Msg.IsValid()) continue;
+
+			if (Msg->HasField(TEXT("reasoning_content")))
+			{
+				FString Reasoning = Msg->GetStringField(TEXT("reasoning_content"));
+				if (!Reasoning.IsEmpty())
 				{
-					FString Thinking = Part->GetStringField(TEXT("thinking"));
-					if (!Thinking.IsEmpty())
+					FString Display = Reasoning.Len() > 300 ? Reasoning.Left(300) + TEXT("...") : Reasoning;
+					Display.ReplaceInline(TEXT("\n"), TEXT(" "));
+					OnToolActivity.Broadcast(FString::Printf(TEXT("Thinking: %s"), *Display));
+				}
+			}
+
+			if (Msg->HasTypedField<EJson::Array>(TEXT("content")))
+			{
+				const TArray<TSharedPtr<FJsonValue>>& ContentParts = Msg->GetArrayField(TEXT("content"));
+				for (const auto& PartVal : ContentParts)
+				{
+					TSharedPtr<FJsonObject> Part = PartVal->AsObject();
+					if (!Part.IsValid()) continue;
+					FString PartType = Part->HasField(TEXT("type")) ? Part->GetStringField(TEXT("type")) : TEXT("");
+					if (PartType == TEXT("thinking") && Part->HasField(TEXT("thinking")))
 					{
-						FString Display = Thinking.Len() > 300 ? Thinking.Left(300) + TEXT("...") : Thinking;
-						Display.ReplaceInline(TEXT("\n"), TEXT(" "));
-						OnToolActivity.Broadcast(FString::Printf(TEXT("Thinking: %s"), *Display));
+						FString Thinking = Part->GetStringField(TEXT("thinking"));
+						if (!Thinking.IsEmpty())
+						{
+							FString Display = Thinking.Len() > 300 ? Thinking.Left(300) + TEXT("...") : Thinking;
+							Display.ReplaceInline(TEXT("\n"), TEXT(" "));
+							OnToolActivity.Broadcast(FString::Printf(TEXT("Thinking: %s"), *Display));
+						}
 					}
 				}
 			}
 		}
+
+		if (!PrefixContent.IsEmpty() && ToolCallMessage.IsValid())
+		{
+			FString Display = PrefixContent.Len() > 300 ? PrefixContent.Left(300) + TEXT("...") : PrefixContent;
+			Display.ReplaceInline(TEXT("\n"), TEXT(" "));
+			OnToolActivity.Broadcast(FString::Printf(TEXT("Thinking: %s"), *Display));
+		}
 	}
 
-	// Format 3: If PrefixContent exists during tool calls, that's the model's reasoning
-	if (!PrefixContent.IsEmpty() && ToolCallMessage.IsValid())
-	{
-		FString Display = PrefixContent.Len() > 300 ? PrefixContent.Left(300) + TEXT("...") : PrefixContent;
-		Display.ReplaceInline(TEXT("\n"), TEXT(" "));
-		OnToolActivity.Broadcast(FString::Printf(TEXT("Thinking: %s"), *Display));
-	}
-
-	// Debug logging
 	FString ResponseModel = Json->HasField(TEXT("model")) ? Json->GetStringField(TEXT("model")) : TEXT("unknown");
 	bool bHasToolCalls = Message.IsValid() && Message->HasField(TEXT("tool_calls"));
-	Log(FString::Printf(TEXT("BridgeService: Response — model=%s, finish_reason=%s, choices=%d, has_tool_calls=%s"),
-		*ResponseModel, *FinishReason, Choices->Num(), bHasToolCalls ? TEXT("YES") : TEXT("NO")));
+	Log(FString::Printf(TEXT("BridgeService: Response — model=%s, finish_reason=%s, %s=%d, has_tool_calls=%s, endpoint=%s"),
+		*ResponseModel, *FinishReason, *MessageVariantLabel, MessageVariantCount, bHasToolCalls ? TEXT("YES") : TEXT("NO"), bResponsesFormat ? TEXT("/responses") : TEXT("/chat/completions")));
 
 	if (!Message.IsValid())
 	{
@@ -1948,6 +2203,7 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 		ToolCallIterations.Remove(RequestId);
 		ForcedFinalResponseRequestIds.Remove(RequestId);
 		NoResponseRetryCounts.Remove(RequestId);
+		MaxCompletionTokenRequestIds.Remove(RequestId);
 		Response.ResultStatus = ECopilotResultStatus::Failure;
 		Response.ErrorMessage = TEXT("No message in response choices");
 		OnResponseReceived.Broadcast(Response);
@@ -2234,6 +2490,7 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 			ToolCallIterations.Remove(RequestId);
 			ForcedFinalResponseRequestIds.Remove(RequestId);
 			NoResponseRetryCounts.Remove(RequestId);
+			MaxCompletionTokenRequestIds.Remove(RequestId);
 			Response.ResultStatus = ECopilotResultStatus::Success;
 			Response.ResponseText = PrefixContent.IsEmpty()
 				? TEXT("I stopped repeated tool-call looping and returned control. Please retry with a narrower prompt or explicit target path.")
@@ -2282,6 +2539,7 @@ HandleNormalResponse:
 				ContinueCount, Content.Len()));
 			
 			TArray<TSharedPtr<FJsonValue>>& ConvoMessages = ActiveConversations.FindOrAdd(ConversationId);
+			LengthContinuationBaseMessageCounts.FindOrAdd(RequestId, ConvoMessages.Num());
 			
 			// Append the partial assistant response
 			TSharedPtr<FJsonObject> PartialMsg = MakeShareable(new FJsonObject);
@@ -2318,12 +2576,22 @@ HandleNormalResponse:
 		Content = *Accumulated + Content;
 		AccumulatedLengthContent.Remove(RequestId);
 	}
+	if (int32* BaseCount = LengthContinuationBaseMessageCounts.Find(RequestId))
+	{
+		TArray<TSharedPtr<FJsonValue>>& ConvoMessages = ActiveConversations.FindOrAdd(ConversationId);
+		while (ConvoMessages.Num() > *BaseCount)
+		{
+			ConvoMessages.Pop();
+		}
+		LengthContinuationBaseMessageCounts.Remove(RequestId);
+	}
 	LengthContinuationCounts.Remove(RequestId);
 
 	PendingRequestTimestamps.Remove(RequestId);
 	ToolCallIterations.Remove(RequestId);
 	ForcedFinalResponseRequestIds.Remove(RequestId);
 	NoResponseRetryCounts.Remove(RequestId);
+	MaxCompletionTokenRequestIds.Remove(RequestId);
 
 	// ALWAYS append assistant message to conversation for multi-turn persistence.
 	// Even if content is empty, we need the message in the chain so the model
@@ -2358,6 +2626,262 @@ HandleNormalResponse:
 
 	Log(FString::Printf(TEXT("BridgeService: Request %s complete (%d chars)"), *RequestId, Response.ResponseText.Len()));
 	OnResponseReceived.Broadcast(Response);
+}
+
+int32 FGitHubCopilotUEBridgeService::EstimateConversationPayloadChars(const TArray<TSharedPtr<FJsonValue>>& Messages) const
+{
+	int32 Total = 0;
+	for (const TSharedPtr<FJsonValue>& MsgVal : Messages)
+	{
+		if (!MsgVal.IsValid() || !MsgVal->AsObject().IsValid())
+		{
+			continue;
+		}
+
+		const TSharedPtr<FJsonObject>& MsgObj = MsgVal->AsObject();
+		if (MsgObj->HasTypedField<EJson::String>(TEXT("content")))
+		{
+			Total += MsgObj->GetStringField(TEXT("content")).Len();
+		}
+		else if (MsgObj->HasTypedField<EJson::Array>(TEXT("content")))
+		{
+			for (const auto& Part : MsgObj->GetArrayField(TEXT("content")))
+			{
+				if (!Part.IsValid() || !Part->AsObject().IsValid())
+				{
+					continue;
+				}
+
+				const TSharedPtr<FJsonObject>& PartObj = Part->AsObject();
+				if (PartObj->HasField(TEXT("text")))
+				{
+					Total += PartObj->GetStringField(TEXT("text")).Len();
+				}
+				if (PartObj->HasField(TEXT("image_url")))
+				{
+					TSharedPtr<FJsonObject> ImageObj = PartObj->GetObjectField(TEXT("image_url"));
+					if (ImageObj.IsValid() && ImageObj->HasField(TEXT("url")))
+					{
+						Total += ImageObj->GetStringField(TEXT("url")).Len();
+					}
+				}
+			}
+		}
+
+		if (MsgObj->HasField(TEXT("tool_calls")))
+		{
+			for (const auto& TC : MsgObj->GetArrayField(TEXT("tool_calls")))
+			{
+				if (!TC.IsValid() || !TC->AsObject().IsValid())
+				{
+					continue;
+				}
+
+				TSharedPtr<FJsonObject> Func = TC->AsObject()->GetObjectField(TEXT("function"));
+				if (Func.IsValid() && Func->HasField(TEXT("arguments")))
+				{
+					Total += Func->GetStringField(TEXT("arguments")).Len() + 50;
+				}
+			}
+		}
+
+		Total += 100;
+	}
+
+	return Total;
+}
+
+bool FGitHubCopilotUEBridgeService::IsCompleteToolInteractionBlock(const TArray<TSharedPtr<FJsonValue>>& Messages, int32 AssistantIndex, int32& OutBlockEndExclusive) const
+{
+	OutBlockEndExclusive = AssistantIndex + 1;
+	if (!Messages.IsValidIndex(AssistantIndex) || !Messages[AssistantIndex].IsValid() || !Messages[AssistantIndex]->AsObject().IsValid())
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>& AssistantMsg = Messages[AssistantIndex]->AsObject();
+	if (GetMessageRole(Messages[AssistantIndex]) != TEXT("assistant") || !AssistantMsg->HasField(TEXT("tool_calls")))
+	{
+		return false;
+	}
+
+	TSet<FString> ExpectedToolCallIds;
+	for (const TSharedPtr<FJsonValue>& ToolCallVal : AssistantMsg->GetArrayField(TEXT("tool_calls")))
+	{
+		if (!ToolCallVal.IsValid() || !ToolCallVal->AsObject().IsValid())
+		{
+			continue;
+		}
+
+		const TSharedPtr<FJsonObject>& ToolCallObj = ToolCallVal->AsObject();
+		if (ToolCallObj->HasField(TEXT("id")))
+		{
+			ExpectedToolCallIds.Add(ToolCallObj->GetStringField(TEXT("id")));
+		}
+	}
+
+	if (ExpectedToolCallIds.Num() == 0)
+	{
+		return false;
+	}
+
+	TSet<FString> SeenToolCallIds;
+	int32 Index = AssistantIndex + 1;
+	while (Messages.IsValidIndex(Index) && GetMessageRole(Messages[Index]) == TEXT("tool"))
+	{
+		const TSharedPtr<FJsonObject>& ToolMsg = Messages[Index]->AsObject();
+		if (!ToolMsg.IsValid() || !ToolMsg->HasField(TEXT("tool_call_id")))
+		{
+			return false;
+		}
+
+		const FString ToolCallId = ToolMsg->GetStringField(TEXT("tool_call_id"));
+		if (!ExpectedToolCallIds.Contains(ToolCallId))
+		{
+			return false;
+		}
+
+		SeenToolCallIds.Add(ToolCallId);
+		++Index;
+	}
+
+	OutBlockEndExclusive = Index;
+	return SeenToolCallIds.Num() == ExpectedToolCallIds.Num();
+}
+
+void FGitHubCopilotUEBridgeService::SanitizeConversationMessages(TArray<TSharedPtr<FJsonValue>>& Messages) const
+{
+	if (Messages.Num() <= 1)
+	{
+		return;
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Sanitized;
+	Sanitized.Reserve(Messages.Num());
+
+	if (Messages[0].IsValid())
+	{
+		Sanitized.Add(Messages[0]);
+	}
+
+	for (int32 Index = 1; Index < Messages.Num();)
+	{
+		if (!Messages[Index].IsValid() || !Messages[Index]->AsObject().IsValid())
+		{
+			++Index;
+			continue;
+		}
+
+		const FString Role = GetMessageRole(Messages[Index]);
+		const TSharedPtr<FJsonObject>& Msg = Messages[Index]->AsObject();
+
+		if (Role == TEXT("assistant") && Msg->HasField(TEXT("tool_calls")))
+		{
+			if (!NormalizeToolCallsForReplay(Msg))
+			{
+				int32 BlockEndExclusive = Index + 1;
+				while (Messages.IsValidIndex(BlockEndExclusive) && GetMessageRole(Messages[BlockEndExclusive]) == TEXT("tool"))
+				{
+					++BlockEndExclusive;
+				}
+
+				Index = BlockEndExclusive;
+				continue;
+			}
+
+			int32 BlockEndExclusive = Index + 1;
+			if (IsCompleteToolInteractionBlock(Messages, Index, BlockEndExclusive))
+			{
+				for (int32 CopyIndex = Index; CopyIndex < BlockEndExclusive; ++CopyIndex)
+				{
+					Sanitized.Add(Messages[CopyIndex]);
+				}
+			}
+			else
+			{
+				while (Messages.IsValidIndex(BlockEndExclusive) && GetMessageRole(Messages[BlockEndExclusive]) == TEXT("tool"))
+				{
+					++BlockEndExclusive;
+				}
+			}
+
+			Index = BlockEndExclusive;
+			continue;
+		}
+
+		if (Role == TEXT("tool"))
+		{
+			++Index;
+			continue;
+		}
+
+		Sanitized.Add(Messages[Index]);
+		++Index;
+	}
+
+	Messages = MoveTemp(Sanitized);
+}
+
+int32 FGitHubCopilotUEBridgeService::FindOldestDroppableConversationRange(const TArray<TSharedPtr<FJsonValue>>& Messages, int32 MinMessagesToKeep, int32& OutRemoveCount) const
+{
+	OutRemoveCount = 0;
+	if (Messages.Num() <= MinMessagesToKeep)
+	{
+		return INDEX_NONE;
+	}
+
+	for (int32 Index = 1; Index < Messages.Num(); ++Index)
+	{
+		if (Messages.Num() - 1 < MinMessagesToKeep)
+		{
+			return INDEX_NONE;
+		}
+
+		const FString Role = GetMessageRole(Messages[Index]);
+		if (Role == TEXT("assistant") && Messages[Index]->AsObject().IsValid() && Messages[Index]->AsObject()->HasField(TEXT("tool_calls")))
+		{
+			int32 BlockEndExclusive = Index + 1;
+			if (IsCompleteToolInteractionBlock(Messages, Index, BlockEndExclusive))
+			{
+				const int32 RemoveCount = BlockEndExclusive - Index;
+				if (Messages.Num() - RemoveCount >= MinMessagesToKeep)
+				{
+					OutRemoveCount = RemoveCount;
+					return Index;
+				}
+			}
+			continue;
+		}
+
+		if (Role == TEXT("tool"))
+		{
+			continue;
+		}
+
+		OutRemoveCount = 1;
+		return Index;
+	}
+
+	return INDEX_NONE;
+}
+
+bool FGitHubCopilotUEBridgeService::PruneConversationToPayloadBudget(TArray<TSharedPtr<FJsonValue>>& Messages, int32 MaxPayloadChars, int32 MinMessagesToKeep) const
+{
+	bool bRemovedAny = false;
+	while (EstimateConversationPayloadChars(Messages) > MaxPayloadChars && Messages.Num() > MinMessagesToKeep)
+	{
+		int32 RemoveCount = 0;
+		const int32 RemoveAt = FindOldestDroppableConversationRange(Messages, MinMessagesToKeep, RemoveCount);
+		if (RemoveAt == INDEX_NONE || RemoveCount <= 0)
+		{
+			break;
+		}
+
+		Messages.RemoveAt(RemoveAt, RemoveCount, EAllowShrinking::No);
+		bRemovedAny = true;
+	}
+
+	return bRemovedAny;
 }
 
 // ============================================================================
@@ -2480,6 +3004,7 @@ void FGitHubCopilotUEBridgeService::LoadConversationCache()
 	CurrentConversationId = SavedConvoId;
 	TArray<TSharedPtr<FJsonValue>>& ConvoMessages = ActiveConversations.FindOrAdd(CurrentConversationId);
 	ConvoMessages = *MessagesArray;
+	SanitizeConversationMessages(ConvoMessages);
 
 	Log(FString::Printf(TEXT("BridgeService: Restored conversation %s from disk (%d messages, %d chars transcript)"),
 		*CurrentConversationId, ConvoMessages.Num(), CachedChatTranscript.Len()));

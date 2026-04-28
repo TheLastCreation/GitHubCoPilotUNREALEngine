@@ -83,6 +83,16 @@ void SGitHubCopilotUEPanel::Construct(const FArguments& InArgs)
 		BridgeLogDelegateHandle = BridgeService->OnLogMessage.AddRaw(this, &SGitHubCopilotUEPanel::OnLogMessageReceived);
 		ActiveModelChangedDelegateHandle = BridgeService->OnActiveModelChanged.AddRaw(this, &SGitHubCopilotUEPanel::OnActiveModelChanged);
 		ToolActivityDelegateHandle = BridgeService->OnToolActivity.AddRaw(this, &SGitHubCopilotUEPanel::OnToolActivity);
+
+		const FString CurrentReasoning = BridgeService->GetReasoningEffort();
+		for (const TSharedPtr<FString>& Option : ReasoningOptions)
+		{
+			if (Option.IsValid() && *Option == CurrentReasoning)
+			{
+				SelectedReasoningOption = Option;
+				break;
+			}
+		}
 	}
 
 	// --- Initialize dark mode text box styles ---
@@ -1450,6 +1460,7 @@ void SGitHubCopilotUEPanel::OnReasoningSelected(TSharedPtr<FString> NewEffort, E
 	{
 		SelectedReasoningOption = NewEffort;
 		BridgeService->SetReasoningEffort(*NewEffort);
+		BridgeService->SaveTokenCache();
 		AppendToLog(FString::Printf(TEXT("Reasoning effort set to: %s"), **NewEffort));
 	}
 }

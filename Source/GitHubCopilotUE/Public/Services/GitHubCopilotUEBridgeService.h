@@ -8,6 +8,7 @@
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Dom/JsonValue.h"
+#include "TimerManager.h"
 
 class FGitHubCopilotUEToolExecutor;
 
@@ -214,6 +215,12 @@ public:
 	FOnCopilotToolActivity OnToolActivity;
 
 private:
+	void SanitizeConversationMessages(TArray<TSharedPtr<FJsonValue>>& Messages) const;
+	bool PruneConversationToPayloadBudget(TArray<TSharedPtr<FJsonValue>>& Messages, int32 MaxPayloadChars, int32 MinMessagesToKeep) const;
+	int32 EstimateConversationPayloadChars(const TArray<TSharedPtr<FJsonValue>>& Messages) const;
+	bool IsCompleteToolInteractionBlock(const TArray<TSharedPtr<FJsonValue>>& Messages, int32 AssistantIndex, int32& OutBlockEndExclusive) const;
+	int32 FindOldestDroppableConversationRange(const TArray<TSharedPtr<FJsonValue>>& Messages, int32 MinMessagesToKeep, int32& OutRemoveCount) const;
+
 	// === Auth flow internals ===
 	void OnDeviceCodeResponse(FHttpRequestPtr HttpReq, FHttpResponsePtr HttpResp, bool bSuccess);
 	void PollForAccessToken();
@@ -281,6 +288,7 @@ private:
 	// Request tracking
 	TMap<FString, double> PendingRequestTimestamps;
 	TMap<FString, int32> NoResponseRetryCounts;
+	TSet<FString> MaxCompletionTokenRequestIds;
 
 	// Queued requests waiting for token refresh
 	TArray<TPair<FCopilotRequest, bool>> QueuedRequestsAwaitingToken;
@@ -293,6 +301,7 @@ private:
 	TSet<FString> ForcedFinalResponseRequestIds; // Requests that already switched to no-tool finalization
 	TMap<FString, int32> LengthContinuationCounts; // RequestId -> how many times we auto-continued on finish_reason=length
 	TMap<FString, FString> AccumulatedLengthContent; // RequestId -> accumulated partial content from length continuations
+	TMap<FString, int32> LengthContinuationBaseMessageCounts; // RequestId -> conversation length before temporary continuation turns were appended
 
 	// Persistent conversation ID — survives panel recreation
 	FString CurrentConversationId;

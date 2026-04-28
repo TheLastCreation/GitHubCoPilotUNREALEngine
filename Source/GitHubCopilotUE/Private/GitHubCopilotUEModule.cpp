@@ -10,6 +10,7 @@
 #include "Services/GitHubCopilotUEPatchService.h"
 #include "Services/GitHubCopilotUECommandRouter.h"
 #include "Services/GitHubCopilotUEBridgeService.h"
+#include "Services/GitHubCopilotUEAssetService.h"
 #include "Services/GitHubCopilotUECompileService.h"
 #include "Services/GitHubCopilotUEQuestService.h"
 #include "Services/GitHubCopilotUESlashCommands.h"
@@ -178,7 +179,7 @@ void FGitHubCopilotUEModule::InitializeServices()
 
 		// Create tool executor and give it to the bridge (makes AI agentic)
 		TSharedPtr<FGitHubCopilotUEToolExecutor> ToolExecutor = MakeShareable(new FGitHubCopilotUEToolExecutor());
-		ToolExecutor->Initialize(FileService, ContextService, CompileService);
+		ToolExecutor->Initialize(FileService, ContextService, CompileService, MakeShareable(new FGitHubCopilotUEAssetService()));
 		BridgeService->SetToolExecutor(ToolExecutor);
 	}
 

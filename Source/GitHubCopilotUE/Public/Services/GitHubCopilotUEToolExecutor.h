@@ -8,6 +8,7 @@
 class FGitHubCopilotUEFileService;
 class FGitHubCopilotUEContextService;
 class FGitHubCopilotUECompileService;
+class FGitHubCopilotUEAssetService;
 
 /**
  * Executes tool calls from the AI model.
@@ -23,14 +24,18 @@ public:
 	void Initialize(
 		TSharedPtr<FGitHubCopilotUEFileService> InFileService,
 		TSharedPtr<FGitHubCopilotUEContextService> InContextService,
-		TSharedPtr<FGitHubCopilotUECompileService> InCompileService
+		TSharedPtr<FGitHubCopilotUECompileService> InCompileService,
+		TSharedPtr<FGitHubCopilotUEAssetService> InAssetService
 	);
 
 	/** Execute a single tool call. Returns the result string. */
 	FString ExecuteTool(const FString& ToolName, const TSharedPtr<FJsonObject>& Arguments);
 
 	/** Build the tools array for the chat completion request. */
-	static TArray<TSharedPtr<FJsonValue>> BuildToolDefinitions();
+	static TArray<TSharedPtr<FJsonValue>> BuildToolDefinitions(bool bResponsesFormat = false);
+
+	/** Validate generated tools before sending them to the API. */
+	static bool ValidateToolDefinitions(const TArray<TSharedPtr<FJsonValue>>& Tools, bool bResponsesFormat, TArray<FString>& OutErrors);
 
 private:
 	// Individual tool implementations
@@ -56,6 +61,9 @@ private:
 	FString Tool_CreateMaterialAsset(const TSharedPtr<FJsonObject>& Args);
 	FString Tool_CreateDataTable(const TSharedPtr<FJsonObject>& Args);
 	FString Tool_CreateNiagaraSystem(const TSharedPtr<FJsonObject>& Args);
+	FString Tool_InspectAsset(const TSharedPtr<FJsonObject>& Args);
+	FString Tool_ModifyAsset(const TSharedPtr<FJsonObject>& Args);
+	FString Tool_CreateAsset(const TSharedPtr<FJsonObject>& Args);
 	FString Tool_WebSearch(const TSharedPtr<FJsonObject>& Args);
 	FString Tool_CaptureViewport(const TSharedPtr<FJsonObject>& Args);
 
@@ -99,6 +107,7 @@ private:
 	TSharedPtr<FGitHubCopilotUEFileService> FileService;
 	TSharedPtr<FGitHubCopilotUEContextService> ContextService;
 	TSharedPtr<FGitHubCopilotUECompileService> CompileService;
+	TSharedPtr<FGitHubCopilotUEAssetService> AssetService;
 
 	/** Helper to build a single tool definition JSON */
 	static TSharedPtr<FJsonValue> MakeToolDef(

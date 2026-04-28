@@ -540,11 +540,14 @@ The loop continues until the AI returns a text response with no further tool cal
 - Use `/models` to confirm the model is available on your subscription
 - Some models (e.g., Opus) may require a Business/Enterprise tier
 - Try switching to a different model: `/model gpt-4o`
+- If the Output Log shows `tools[0].name`, the request likely went to `/responses` with chat-completions-style tool JSON. Current builds log this explicitly as a tool-shape mismatch.
+- If the Output Log shows `invalid_function_parameters` or `array schema missing items`, inspect the plugin's tool schema validation logs first. Array parameters must declare an `items.type` schema before the request is sent.
 
 ### Tool calls not working
 - Check that `Allowed Write Roots` in Project Settings includes the directories you expect
 - Ensure `Enable Compile Commands` is checked if you want the AI to compile
 - Check Output Log with verbose logging enabled for detailed tool execution traces
+- For Codex-style `/responses` models, look for `BridgeService: [/responses]` log lines. The plugin now validates tool definitions locally and logs parse failures for `/responses` payloads before falling back to generic API errors.
 
 ### Plugin doesn't appear
 - Ensure the folder structure is correct (`.uplugin` must be at the root of the plugin folder)

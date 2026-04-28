@@ -17,6 +17,7 @@ PublicDependencyModuleNames.AddRange(new string[]
 "Slate",
 "SlateCore",
 "InputCore",
+"EnhancedInput",
 "Json",
 "JsonUtilities",
 "HTTP",
