@@ -11,6 +11,7 @@
 #include "Misc/Base64.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "HAL/FileManager.h"
 #include "HAL/PlatformProcess.h"
 #include "Containers/Ticker.h"
 #include "GenericPlatform/GenericPlatformHttp.h"
@@ -321,6 +322,7 @@ void FGitHubCopilotUEBridgeService::Shutdown()
 	SaveConversationCache();
 	PendingRequestTimestamps.Empty();
 	NoResponseRetryCounts.Empty();
+	RequestDiagnostics.Empty();
 	LengthContinuationCounts.Empty();
 	AccumulatedLengthContent.Empty();
 	LengthContinuationBaseMessageCounts.Empty();
@@ -1285,7 +1287,137 @@ FString FGitHubCopilotUEBridgeService::BuildSystemPrompt(const FCopilotRequest& 
 		TEXT("- Just talk normally. Explain things in sentences and paragraphs."),
 		*EngineVer, *ProjectName, *ProjectDir);
 
+	const FString InstructionBlock = BuildInstructionBlock();
+	if (!InstructionBlock.IsEmpty())
+	{
+		Prompt += TEXT("\n\n");
+		Prompt += InstructionBlock;
+	}
+
 	return Prompt;
+}
+
+FString FGitHubCopilotUEBridgeService::GetProjectInstructionsPath() const
+{
+	return FPaths::Combine(FPaths::ProjectDir(), TEXT(".github/copilot-instructions.md"));
+}
+
+FString FGitHubCopilotUEBridgeService::BuildDefaultToolInstructions() const
+{
+	FString Instructions;
+	Instructions += TEXT("TOOLING RULES THAT APPLY TO EVERY MODEL:\n");
+	Instructions += TEXT("Use the built-in tools proactively for project inspection, file reads, asset inspection, searches, compile checks, and editor automation. Do not ask the user to manually inspect files when a read, search, asset, or compile tool can answer it.\n");
+	Instructions += TEXT("For text files, inspect the current content before editing. Use edit_file for small surgical replacements when old_str can include enough exact context to match exactly once. Use write_file for new files or deliberate full-file rewrites. Do not use shell commands, Python scripts, or ad-hoc file writes to create or edit text files when write_file or edit_file can do it.\n");
+	Instructions += TEXT("For Unreal assets, do not treat .uasset files as text. Use asset tools or Unreal Python/editor tooling to inspect and modify assets, materials, data assets, Blueprints, and content browser objects.\n");
+	Instructions += TEXT("For code changes, keep edits scoped, preserve existing style, and run compile or Live Coding tools when feasible. If a tool fails because an exact match is stale or duplicated, re-read the relevant range and retry with better context rather than guessing.\n");
+	Instructions += TEXT("File mutations must stay inside the configured allowed write roots and additional allowed paths unless unrestricted access is explicitly enabled in settings.");
+	return Instructions;
+}
+
+FString FGitHubCopilotUEBridgeService::BuildInstructionBlock() const
+{
+	const FString ProjectInstructionsPath = GetProjectInstructionsPath();
+	const bool bProjectInstructionsExist = FPaths::FileExists(ProjectInstructionsPath);
+	const FDateTime ProjectInstructionsTimestamp = bProjectInstructionsExist
+		? IFileManager::Get().GetTimeStamp(*ProjectInstructionsPath)
+		: FDateTime();
+
+	if (bInstructionCacheValid
+		&& bCachedProjectInstructionsExist == bProjectInstructionsExist
+		&& CachedProjectInstructionTimestamp == ProjectInstructionsTimestamp)
+	{
+		return CachedInstructionBlock;
+	}
+
+	CachedInstructionSources.Empty();
+	CachedProjectInstructionTimestamp = ProjectInstructionsTimestamp;
+	bCachedProjectInstructionsExist = bProjectInstructionsExist;
+	bCachedProjectInstructionsTruncated = false;
+
+	FString Instructions = BuildDefaultToolInstructions();
+	CachedInstructionSources.Add(TEXT("built-in tool guidance"));
+
+	if (bProjectInstructionsExist)
+	{
+		FString ProjectInstructions;
+		if (FFileHelper::LoadFileToString(ProjectInstructions, *ProjectInstructionsPath))
+		{
+			ProjectInstructions = ProjectInstructions.TrimStartAndEnd();
+			constexpr int32 MaxProjectInstructionChars = 24000;
+			if (ProjectInstructions.Len() > MaxProjectInstructionChars)
+			{
+				ProjectInstructions = ProjectInstructions.Left(MaxProjectInstructionChars);
+				bCachedProjectInstructionsTruncated = true;
+			}
+
+			if (!ProjectInstructions.IsEmpty())
+			{
+				Instructions += TEXT("\n\nPROJECT INSTRUCTIONS FROM .github/copilot-instructions.md:\n");
+				Instructions += ProjectInstructions;
+				CachedInstructionSources.Add(ProjectInstructionsPath);
+			}
+		}
+	}
+
+	CachedInstructionBlock = Instructions;
+	CachedInstructionBytes = CachedInstructionBlock.Len();
+	bInstructionCacheValid = true;
+	return CachedInstructionBlock;
+}
+
+void FGitHubCopilotUEBridgeService::ReloadInstructions()
+{
+	bInstructionCacheValid = false;
+	CachedInstructionBlock.Empty();
+	CachedInstructionSources.Empty();
+	bRefreshSystemPromptOnNextRequest = true;
+	Log(TEXT("BridgeService: Copilot instructions cache invalidated"));
+}
+
+FString FGitHubCopilotUEBridgeService::GetInstructionStatus() const
+{
+	BuildInstructionBlock();
+
+	FString Result = FString::Printf(TEXT("Instructions loaded: %d chars\n"), CachedInstructionBytes);
+	Result += TEXT("Sources:\n");
+	for (const FString& Source : CachedInstructionSources)
+	{
+		Result += FString::Printf(TEXT("  %s\n"), *Source);
+	}
+
+	const FString ProjectInstructionsPath = GetProjectInstructionsPath();
+	if (!bCachedProjectInstructionsExist)
+	{
+		Result += FString::Printf(TEXT("Project instructions: not found at %s\n"), *ProjectInstructionsPath);
+	}
+	else if (bCachedProjectInstructionsTruncated)
+	{
+		Result += TEXT("Project instructions were truncated to 24000 chars for prompt safety.\n");
+	}
+
+	Result += bRefreshSystemPromptOnNextRequest
+		? TEXT("Active conversation system prompt will refresh on the next request.")
+		: TEXT("Instruction cache is current.");
+	return Result;
+}
+
+void FGitHubCopilotUEBridgeService::AddRequestDiagnosticsToResponse(FCopilotResponse& Response, const FString& RequestId, int32 RequestStatus) const
+{
+	Response.ProviderMetadata.Add(TEXT("request_status"), FString::FromInt(RequestStatus));
+
+	const FRequestDiagnostics* Diagnostics = RequestDiagnostics.Find(RequestId);
+	if (!Diagnostics)
+	{
+		return;
+	}
+
+	Response.ProviderMetadata.Add(TEXT("requested_model"), Diagnostics->RequestedModel);
+	Response.ProviderMetadata.Add(TEXT("endpoint_url"), Diagnostics->EndpointUrl);
+	Response.ProviderMetadata.Add(TEXT("endpoint_path"), Diagnostics->EndpointPath);
+	Response.ProviderMetadata.Add(TEXT("endpoint_format"), Diagnostics->bResponsesFormat ? TEXT("responses") : TEXT("chat_completions"));
+	Response.ProviderMetadata.Add(TEXT("tool_mode"), Diagnostics->bAllowToolCalls ? TEXT("on") : TEXT("off"));
+	Response.ProviderMetadata.Add(TEXT("tool_count"), FString::FromInt(Diagnostics->ToolCount));
+	Response.ProviderMetadata.Add(TEXT("payload_chars"), FString::FromInt(Diagnostics->PayloadChars));
 }
 
 void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Request, bool bAllowToolCalls)
@@ -1331,11 +1463,23 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 		SystemMsg->SetStringField(TEXT("role"), TEXT("system"));
 		SystemMsg->SetStringField(TEXT("content"), BuildSystemPrompt(Request));
 		ConvoMessages.Add(MakeShareable(new FJsonValueObject(SystemMsg)));
+		bRefreshSystemPromptOnNextRequest = false;
 
 		Log(FString::Printf(TEXT("BridgeService: [CONVO] NEW conversation %s — system prompt added"), *ConvoKey));
 	}
 	else
 	{
+		if (bRefreshSystemPromptOnNextRequest && ConvoMessages[0].IsValid() && ConvoMessages[0]->AsObject().IsValid())
+		{
+			TSharedPtr<FJsonObject> FirstMessage = ConvoMessages[0]->AsObject();
+			if (FirstMessage->HasField(TEXT("role")) && FirstMessage->GetStringField(TEXT("role")) == TEXT("system"))
+			{
+				FirstMessage->SetStringField(TEXT("content"), BuildSystemPrompt(Request));
+				bRefreshSystemPromptOnNextRequest = false;
+				Log(FString::Printf(TEXT("BridgeService: [CONVO] Refreshed system prompt for %s after instruction reload"), *ConvoKey));
+			}
+		}
+
 		// Existing conversation — log the message roles for diagnostics
 		FString RoleSummary;
 		for (const TSharedPtr<FJsonValue>& MsgVal : ConvoMessages)
@@ -1642,6 +1786,7 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 			break;
 		}
 	}
+	int32 ToolCountSent = 0;
 
 	if (bUseResponsesFormat)
 	{
@@ -1725,6 +1870,7 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 		if (bAllowToolCalls)
 		{
 			TArray<TSharedPtr<FJsonValue>> Tools = FGitHubCopilotUEToolExecutor::BuildToolDefinitions(true);
+			ToolCountSent = Tools.Num();
 			TArray<FString> ToolErrors;
 			if (!FGitHubCopilotUEToolExecutor::ValidateToolDefinitions(Tools, true, ToolErrors))
 			{
@@ -1791,6 +1937,7 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 		if (bAllowToolCalls)
 		{
 			TArray<TSharedPtr<FJsonValue>> Tools = FGitHubCopilotUEToolExecutor::BuildToolDefinitions(false);
+			ToolCountSent = Tools.Num();
 			TArray<FString> ToolErrors;
 			if (!FGitHubCopilotUEToolExecutor::ValidateToolDefinitions(Tools, false, ToolErrors))
 			{
@@ -1829,9 +1976,20 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 	FJsonSerializer::Serialize(JsonBody.ToSharedRef(), Writer);
 	Writer->Close();
 
+	const FString EndpointUrl = GetEndpointURLForModel(ModelToUse);
+	FRequestDiagnostics Diagnostics;
+	Diagnostics.RequestedModel = ModelToUse;
+	Diagnostics.EndpointUrl = EndpointUrl;
+	Diagnostics.EndpointPath = bUseResponsesFormat ? TEXT("/responses") : TEXT("/chat/completions");
+	Diagnostics.bResponsesFormat = bUseResponsesFormat;
+	Diagnostics.bAllowToolCalls = bAllowToolCalls;
+	Diagnostics.ToolCount = ToolCountSent;
+	Diagnostics.PayloadChars = RequestBody.Len();
+	RequestDiagnostics.Add(Request.RequestId, Diagnostics);
+
 	// Log payload size + preview for debugging
 	Log(FString::Printf(TEXT("BridgeService: Request payload size: %d chars, endpoint: %s"),
-		RequestBody.Len(), *GetEndpointURLForModel(ModelToUse)));
+		RequestBody.Len(), *EndpointUrl));
 	if (RequestBody.Len() > 0)
 	{
 		FString Preview = RequestBody.Left(500);
@@ -1843,7 +2001,7 @@ void FGitHubCopilotUEBridgeService::SendChatCompletion(const FCopilotRequest& Re
 	}
 
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpReq = FHttpModule::Get().CreateRequest();
-	HttpReq->SetURL(GetEndpointURLForModel(ModelToUse));
+	HttpReq->SetURL(EndpointUrl);
 	HttpReq->SetVerb(TEXT("POST"));
 	HttpReq->SetHeader(TEXT("Authorization"), FString::Printf(TEXT("Bearer %s"), *CopilotToken));
 	HttpReq->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
@@ -1890,6 +2048,50 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 	{
 		const int32 RequestStatus = HttpReq.IsValid() ? static_cast<int32>(HttpReq->GetStatus()) : -1;
 		const FString RequestUrl = HttpReq.IsValid() ? HttpReq->GetURL() : TEXT("unknown");
+		const FRequestDiagnostics* Diagnostics = RequestDiagnostics.Find(RequestId);
+		const bool bCanFallbackToNoTools = Diagnostics
+			&& Diagnostics->bResponsesFormat
+			&& Diagnostics->bAllowToolCalls
+			&& !ForcedFinalResponseRequestIds.Contains(RequestId);
+		if (bCanFallbackToNoTools)
+		{
+			const FString FallbackModel = Diagnostics->RequestedModel;
+			ForcedFinalResponseRequestIds.Add(RequestId);
+			PendingRequestTimestamps.Add(RequestId, FPlatformTime::Seconds());
+			NoResponseRetryCounts.Remove(RequestId);
+			RequestDiagnostics.Remove(RequestId);
+
+			TArray<TSharedPtr<FJsonValue>>& ConvoMessages = ActiveConversations.FindOrAdd(ConversationId);
+			TSharedPtr<FJsonObject> FallbackMsg = MakeShareable(new FJsonObject);
+			FallbackMsg->SetStringField(TEXT("role"), TEXT("system"));
+			FallbackMsg->SetStringField(TEXT("content"),
+				TEXT("The previous tool-enabled /responses request did not receive an HTTP response from the API. Stop calling tools for this turn. Use the tool results already in the conversation to give the user the best current answer, mention any unfinished work, and suggest switching to a /chat/completions model if more tool work is required."));
+			ConvoMessages.Add(MakeShareable(new FJsonValueObject(FallbackMsg)));
+
+			Log(FString::Printf(
+				TEXT("BridgeService: /responses request %s got no HTTP response with tools enabled; retrying once with tools disabled (model=%s, url=%s)"),
+				*RequestId,
+				*FallbackModel,
+				*RequestUrl));
+
+			FCopilotRequest RetryRequest;
+			RetryRequest.RequestId = RequestId;
+			RetryRequest.ConversationId = ConversationId;
+			RetryRequest.CommandType = ECopilotCommandType::Ask;
+
+			if (IsCopilotTokenExpired())
+			{
+				Log(TEXT("BridgeService: Token expired before no-tool fallback — queuing fallback after refresh"));
+				QueuedRequestsAwaitingToken.Add(TPair<FCopilotRequest, bool>(RetryRequest, false));
+				RefreshCopilotTokenIfNeeded();
+			}
+			else
+			{
+				SendChatCompletion(RetryRequest, false);
+			}
+			return;
+		}
+
 		int32& RetryCount = NoResponseRetryCounts.FindOrAdd(RequestId);
 		if (RetryCount < MaxNoResponseRetries)
 		{
@@ -1928,16 +2130,30 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 		// Don't remove ActiveConversations — conversation persists across errors
 		ToolCallIterations.Remove(RequestId);
 		ForcedFinalResponseRequestIds.Remove(RequestId);
-		NoResponseRetryCounts.Remove(RequestId);
 		Response.ResultStatus = ECopilotResultStatus::Failure;
+		AddRequestDiagnosticsToResponse(Response, RequestId, RequestStatus);
+		const FString RequestedModel = Response.ProviderMetadata.Contains(TEXT("requested_model")) ? Response.ProviderMetadata.FindRef(TEXT("requested_model")) : TEXT("unknown");
+		const FString Endpoint = Response.ProviderMetadata.Contains(TEXT("endpoint_url")) ? Response.ProviderMetadata.FindRef(TEXT("endpoint_url")) : RequestUrl;
+		const FString ToolMode = Response.ProviderMetadata.Contains(TEXT("tool_mode")) ? Response.ProviderMetadata.FindRef(TEXT("tool_mode")) : TEXT("unknown");
+		const FString ToolCount = Response.ProviderMetadata.Contains(TEXT("tool_count")) ? Response.ProviderMetadata.FindRef(TEXT("tool_count")) : TEXT("unknown");
+		const FString PayloadChars = Response.ProviderMetadata.Contains(TEXT("payload_chars")) ? Response.ProviderMetadata.FindRef(TEXT("payload_chars")) : TEXT("unknown");
 		Response.ErrorMessage = FString::Printf(
-			TEXT("Request to Copilot failed after retry (no HTTP response, request_status=%d)."),
-			RequestStatus);
+			TEXT("Request to Copilot failed after retry (no HTTP response, request_status=%d, model=%s, endpoint=%s, tools=%s, tool_count=%s, payload_chars=%s)."),
+			RequestStatus,
+			*RequestedModel,
+			*Endpoint,
+			*ToolMode,
+			*ToolCount,
+			*PayloadChars);
 		Log(FString::Printf(
-			TEXT("BridgeService: Request %s failed after retry (no HTTP response, status=%d, url=%s)"),
+			TEXT("BridgeService: Request %s failed after retry (no HTTP response, status=%d, url=%s, model=%s, tools=%s)"),
 			*RequestId,
 			RequestStatus,
-			*RequestUrl));
+			*RequestUrl,
+			*RequestedModel,
+			*ToolMode));
+		NoResponseRetryCounts.Remove(RequestId);
+		RequestDiagnostics.Remove(RequestId);
 		OnResponseReceived.Broadcast(Response);
 		return;
 	}
@@ -1962,8 +2178,11 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 		ForcedFinalResponseRequestIds.Remove(RequestId);
 		NoResponseRetryCounts.Remove(RequestId);
 		Response.ResultStatus = ECopilotResultStatus::Failure;
-		Response.ErrorMessage = FString::Printf(TEXT("Copilot API error (HTTP %d): %s"), StatusCode, *Body.Left(500));
-		Log(FString::Printf(TEXT("BridgeService: Request %s failed - HTTP %d"), *RequestId, StatusCode));
+		AddRequestDiagnosticsToResponse(Response, RequestId, StatusCode);
+		const FString RequestedModel = Response.ProviderMetadata.Contains(TEXT("requested_model")) ? Response.ProviderMetadata.FindRef(TEXT("requested_model")) : TEXT("unknown");
+		const FString Endpoint = Response.ProviderMetadata.Contains(TEXT("endpoint_url")) ? Response.ProviderMetadata.FindRef(TEXT("endpoint_url")) : TEXT("unknown");
+		Response.ErrorMessage = FString::Printf(TEXT("Copilot API error (HTTP %d, model=%s, endpoint=%s): %s"), StatusCode, *RequestedModel, *Endpoint, *Body.Left(500));
+		Log(FString::Printf(TEXT("BridgeService: Request %s failed - HTTP %d (model=%s, endpoint=%s)"), *RequestId, StatusCode, *RequestedModel, *Endpoint));
 		UE_LOG(LogGitHubCopilotUE, Warning, TEXT("GitHub Copilot: API error (HTTP %d)"), StatusCode);
 
 		if (StatusCode == 401)
@@ -2025,6 +2244,7 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 			}
 		}
 
+		RequestDiagnostics.Remove(RequestId);
 		OnResponseReceived.Broadcast(Response);
 		return;
 	}
@@ -2041,6 +2261,8 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 		MaxCompletionTokenRequestIds.Remove(RequestId);
 		Response.ResultStatus = ECopilotResultStatus::Failure;
 		Response.ErrorMessage = TEXT("Failed to parse Copilot response JSON");
+		AddRequestDiagnosticsToResponse(Response, RequestId, StatusCode);
+		RequestDiagnostics.Remove(RequestId);
 		OnResponseReceived.Broadcast(Response);
 		return;
 	}
@@ -2065,6 +2287,8 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 			Response.ResultStatus = ECopilotResultStatus::Failure;
 			Response.ErrorMessage = FString::Printf(TEXT("Failed to parse /responses payload: %s"), *ParseError);
 			Log(FString::Printf(TEXT("BridgeService: /responses parse failure for %s: %s"), *RequestId, *ParseError));
+			AddRequestDiagnosticsToResponse(Response, RequestId, StatusCode);
+			RequestDiagnostics.Remove(RequestId);
 			OnResponseReceived.Broadcast(Response);
 			return;
 		}
@@ -2088,6 +2312,8 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 			MaxCompletionTokenRequestIds.Remove(RequestId);
 			Response.ResultStatus = ECopilotResultStatus::Failure;
 			Response.ErrorMessage = TEXT("No choices in Copilot response");
+			AddRequestDiagnosticsToResponse(Response, RequestId, StatusCode);
+			RequestDiagnostics.Remove(RequestId);
 			OnResponseReceived.Broadcast(Response);
 			return;
 		}
@@ -2206,6 +2432,8 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 		MaxCompletionTokenRequestIds.Remove(RequestId);
 		Response.ResultStatus = ECopilotResultStatus::Failure;
 		Response.ErrorMessage = TEXT("No message in response choices");
+		AddRequestDiagnosticsToResponse(Response, RequestId, StatusCode);
+		RequestDiagnostics.Remove(RequestId);
 		OnResponseReceived.Broadcast(Response);
 		return;
 	}
@@ -2496,6 +2724,8 @@ void FGitHubCopilotUEBridgeService::OnChatCompletionResponse(FHttpRequestPtr Htt
 				? TEXT("I stopped repeated tool-call looping and returned control. Please retry with a narrower prompt or explicit target path.")
 				: PrefixContent;
 			Response.bSuccess = true;
+			AddRequestDiagnosticsToResponse(Response, RequestId, StatusCode);
+			RequestDiagnostics.Remove(RequestId);
 			OnResponseReceived.Broadcast(Response);
 			return;
 		}
@@ -2621,6 +2851,8 @@ HandleNormalResponse:
 	{
 		Response.ProviderMetadata.Add(TEXT("model"), Json->GetStringField(TEXT("model")));
 	}
+	AddRequestDiagnosticsToResponse(Response, RequestId, 200);
+	RequestDiagnostics.Remove(RequestId);
 
 	Response.bSuccess = (Response.ResultStatus == ECopilotResultStatus::Success);
 
@@ -3087,6 +3319,8 @@ void FGitHubCopilotUEBridgeService::CheckForTimeouts()
 		TimeoutResp.RequestId = ReqId;
 		TimeoutResp.ResultStatus = ECopilotResultStatus::Timeout;
 		TimeoutResp.ErrorMessage = TEXT("Request timed out");
+		AddRequestDiagnosticsToResponse(TimeoutResp, ReqId, -1);
+		RequestDiagnostics.Remove(ReqId);
 		Log(FString::Printf(TEXT("BridgeService: Request %s timed out"), *ReqId));
 		OnResponseReceived.Broadcast(TimeoutResp);
 	}

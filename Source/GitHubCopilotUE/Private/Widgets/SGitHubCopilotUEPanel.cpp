@@ -1553,13 +1553,36 @@ void SGitHubCopilotUEPanel::OnResponseReceived(const FCopilotResponse& Response)
 		if (const FString* ReturnedModel = Response.ProviderMetadata.Find(TEXT("model")))
 		{
 			const FString TrimmedModel = ReturnedModel->TrimStartAndEnd();
-			Speaker = TrimmedModel.IsEmpty()
-				? TEXT("Model (API: missing)")
-				: FString::Printf(TEXT("Model (%s)"), *TrimmedModel);
+			if (!TrimmedModel.IsEmpty())
+			{
+				Speaker = FString::Printf(TEXT("Model (%s)"), *TrimmedModel);
+			}
+			else if (const FString* RequestedModel = Response.ProviderMetadata.Find(TEXT("requested_model")))
+			{
+				Speaker = FString::Printf(TEXT("Model (%s, API did not return model metadata)"), **RequestedModel);
+			}
+			else
+			{
+				Speaker = TEXT("Model (API metadata missing)");
+			}
+		}
+		else if (const FString* RequestedModel = Response.ProviderMetadata.Find(TEXT("requested_model")))
+		{
+			FString Detail = TEXT("API metadata missing");
+			if (Response.ErrorMessage.Contains(TEXT("no HTTP response"), ESearchCase::IgnoreCase))
+			{
+				Detail = TEXT("no API response");
+			}
+			else if (const FString* RequestStatus = Response.ProviderMetadata.Find(TEXT("request_status")))
+			{
+				Detail = FString::Printf(TEXT("request_status=%s"), **RequestStatus);
+			}
+
+			Speaker = FString::Printf(TEXT("Model (%s, %s)"), **RequestedModel, *Detail);
 		}
 		else if (CommandRouter.IsValid() && CommandRouter->RequiresBackend(ResolvedCommandType))
 		{
-			Speaker = TEXT("Model (API: missing)");
+			Speaker = TEXT("Model (API metadata missing)");
 		}
 
 		FString DisplayText;

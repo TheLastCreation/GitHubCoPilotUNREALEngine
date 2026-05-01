@@ -5,8 +5,10 @@
 #include "Services/GitHubCopilotUEBridgeService.h"
 #include "Services/GitHubCopilotUEContextService.h"
 #include "Services/GitHubCopilotUEFileService.h"
+#include "Services/GitHubCopilotUEToolExecutor.h"
 #include "GitHubCopilotUESettings.h"
 #include "HAL/PlatformApplicationMisc.h"
+#include "HAL/FileManager.h"
 #include "Misc/App.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -61,6 +63,7 @@ void FGitHubCopilotUESlashCommands::RegisterCommands()
 
 	// ===== Model Selection =====
 	Commands.Add({TEXT("model"), {TEXT("models")}, TEXT("/model [model-name]"), TEXT("Select AI model to use or list available models"), false, true});
+	Commands.Add({TEXT("model-debug"), {}, TEXT("/model-debug"), TEXT("Show active model, endpoint, tools, and instruction state"), false, true});
 
 	// ===== Context & Info =====
 	Commands.Add({TEXT("context"), {}, TEXT("/context"), TEXT("Show project context, selected assets, and active state"), false, true});
@@ -68,7 +71,7 @@ void FGitHubCopilotUESlashCommands::RegisterCommands()
 	Commands.Add({TEXT("list-dirs"), {}, TEXT("/list-dirs"), TEXT("Display all allowed directories for file access"), false, true});
 	Commands.Add({TEXT("add-dir"), {}, TEXT("/add-dir <directory>"), TEXT("Add a directory to the allowed list for file access"), false, true});
 	Commands.Add({TEXT("init"), {}, TEXT("/init"), TEXT("Initialize Copilot instructions for this project"), false, true});
-	Commands.Add({TEXT("instructions"), {}, TEXT("/instructions"), TEXT("View and toggle custom instruction files"), false, true});
+	Commands.Add({TEXT("instructions"), {}, TEXT("/instructions [reload]"), TEXT("View or reload custom instruction files"), false, true});
 
 	// ===== Session =====
 	Commands.Add({TEXT("clear"), {TEXT("new")}, TEXT("/clear"), TEXT("Clear the conversation history"), false, true});
@@ -171,6 +174,7 @@ FString FGitHubCopilotUESlashCommands::GetHelpText() const
 
 	Help += TEXT("--- Model ---\n");
 	Help += TEXT("  /model, /models [model-name]         Select AI model or list available\n\n");
+	Help += TEXT("  /model-debug                         Show model endpoint, tools, and instructions\n\n");
 
 	Help += TEXT("--- Context & Info ---\n");
 	Help += TEXT("  /context                             Show project context and state\n");
@@ -178,7 +182,7 @@ FString FGitHubCopilotUESlashCommands::GetHelpText() const
 	Help += TEXT("  /list-dirs                           Display allowed write directories\n");
 	Help += TEXT("  /add-dir <directory>                 Add directory to allowed list\n");
 	Help += TEXT("  /init                                Initialize Copilot for this project\n");
-	Help += TEXT("  /instructions                        View custom instruction files\n\n");
+	Help += TEXT("  /instructions [reload]               View or reload custom instruction files\n\n");
 
 	Help += TEXT("--- Session ---\n");
 	Help += TEXT("  /clear, /new                         Clear conversation history\n");
@@ -292,6 +296,7 @@ bool FGitHubCopilotUESlashCommands::ExecuteSlashCommand(const FString& Input, FS
 	else if (MatchedName == TEXT("copy")) OutResponse = HandleCopy(Args);
 	else if (MatchedName == TEXT("context")) OutResponse = HandleContext(Args);
 	else if (MatchedName == TEXT("model")) OutResponse = HandleModel(Args);
+	else if (MatchedName == TEXT("model-debug")) OutResponse = HandleModelDebug(Args);
 	else if (MatchedName == TEXT("login")) OutResponse = HandleLogin(Args);
 	else if (MatchedName == TEXT("logout")) OutResponse = HandleLogout(Args);
 	else if (MatchedName == TEXT("list-dirs")) OutResponse = HandleListDirs(Args);
@@ -328,7 +333,7 @@ bool FGitHubCopilotUESlashCommands::ExecuteSlashCommand(const FString& Input, FS
 	else if (MatchedName == TEXT("experimental")) OutResponse = TEXT("Experimental features are managed in Project Settings -> Plugins -> GitHub Copilot UE.");
 	else if (MatchedName == TEXT("allow-all")) OutResponse = HandleAllowAll();
 	else if (MatchedName == TEXT("reset-allowed-tools")) OutResponse = HandleResetAllowed();
-	else if (MatchedName == TEXT("instructions")) OutResponse = HandleInit(TEXT("show"));
+	else if (MatchedName == TEXT("instructions")) OutResponse = HandleInit(Args.IsEmpty() ? TEXT("show") : Args);
 	else if (MatchedName == TEXT("delegate")) { OnSendPrompt.ExecuteIfBound(ECopilotCommandType::AnalyzeProject, TEXT("Create a PR with the following changes: ") + Args); OutResponse = TEXT("Delegating to Copilot for PR creation..."); }
 	else
 	{
@@ -519,6 +524,41 @@ FString FGitHubCopilotUESlashCommands::HandleModel(const FString& Args)
 	return FString::Printf(TEXT("Model set to: %s"), *CurrentModel);
 }
 
+FString FGitHubCopilotUESlashCommands::HandleModelDebug(const FString& Args)
+{
+	if (!BridgeService.IsValid())
+	{
+		return TEXT("Bridge service not available.");
+	}
+
+	const FString ActiveModel = BridgeService->GetActiveModel();
+	const FCopilotModel* ActiveInfo = BridgeService->GetActiveModelInfo();
+	const bool bResponsesFormat = ActiveInfo ? ActiveInfo->RequiresResponsesFormat() : false;
+	const int32 ToolCount = FGitHubCopilotUEToolExecutor::BuildToolDefinitions(bResponsesFormat).Num();
+
+	FString Result = TEXT("=== Model Debug ===\n");
+	Result += FString::Printf(TEXT("Active model: %s\n"), ActiveModel.IsEmpty() ? TEXT("none") : *ActiveModel);
+	Result += FString::Printf(TEXT("API base: %s\n"), *BridgeService->GetAPIBase());
+	Result += FString::Printf(TEXT("Endpoint format: %s\n"), bResponsesFormat ? TEXT("/responses") : TEXT("/chat/completions"));
+	Result += FString::Printf(TEXT("Tool definitions: %d\n"), ToolCount);
+
+	if (ActiveInfo)
+	{
+		Result += FString::Printf(TEXT("Vendor: %s\n"), *ActiveInfo->Vendor);
+		Result += FString::Printf(TEXT("Tools supported by model: %s\n"), ActiveInfo->bSupportsToolCalls ? TEXT("yes") : TEXT("no"));
+		Result += FString::Printf(TEXT("Vision: %s\n"), ActiveInfo->bSupportsVision ? TEXT("yes") : TEXT("no"));
+		Result += FString::Printf(TEXT("Context window: %d tokens\n"), ActiveInfo->MaxContextWindowTokens);
+	}
+	else
+	{
+		Result += TEXT("Active model metadata is unavailable. Use /model to refresh or select a model.\n");
+	}
+
+	Result += TEXT("\n");
+	Result += BridgeService->GetInstructionStatus();
+	return Result;
+}
+
 FString FGitHubCopilotUESlashCommands::HandleLogin(const FString& Args)
 {
 	if (!BridgeService.IsValid())
@@ -686,14 +726,64 @@ FString FGitHubCopilotUESlashCommands::HandleTest(const FString& Args)
 
 FString FGitHubCopilotUESlashCommands::HandleInit(const FString& Args)
 {
+	const FString Mode = Args.TrimStartAndEnd().ToLower();
 	FString InstructionsPath = FPaths::Combine(FPaths::ProjectDir(), TEXT(".github/copilot-instructions.md"));
+
+	if (Mode == TEXT("reload"))
+	{
+		if (BridgeService.IsValid())
+		{
+			BridgeService->ReloadInstructions();
+			return BridgeService->GetInstructionStatus();
+		}
+		return TEXT("Bridge service not available.");
+	}
+
 	if (FPaths::FileExists(InstructionsPath))
 	{
 		FString Content;
 		FFileHelper::LoadFileToString(Content, *InstructionsPath);
-		return FString::Printf(TEXT("=== Copilot Instructions ===\nFile: %s\n\n%s"), *InstructionsPath, *Content);
+		FString Result = FString::Printf(TEXT("=== Copilot Instructions ===\nFile: %s\n\n%s"), *InstructionsPath, *Content);
+		if (BridgeService.IsValid())
+		{
+			Result += TEXT("\n\n");
+			Result += BridgeService->GetInstructionStatus();
+		}
+		return Result;
 	}
-	return FString::Printf(TEXT("No Copilot instructions file found.\nCreate one at: %s\nThis file provides project-specific context to Copilot."), *InstructionsPath);
+
+	if (Mode == TEXT("show"))
+	{
+		FString Result = FString::Printf(TEXT("No Copilot instructions file found.\nCreate one with /init at: %s\nBuilt-in tool instructions are still applied to every model."), *InstructionsPath);
+		if (BridgeService.IsValid())
+		{
+			Result += TEXT("\n\n");
+			Result += BridgeService->GetInstructionStatus();
+		}
+		return Result;
+	}
+
+	const FString InstructionsDir = FPaths::GetPath(InstructionsPath);
+	IFileManager::Get().MakeDirectory(*InstructionsDir, true);
+
+	const FString DefaultContent =
+		TEXT("# GitHub Copilot UE project instructions\n\n")
+		TEXT("Keep changes scoped to the user's request and follow existing Unreal C++ and content conventions.\n\n")
+		TEXT("Use the plugin's built-in read, search, edit, write, asset, Python, compile, and test tools instead of asking the user to do manual checks.\n\n")
+		TEXT("For text files, inspect first, use exact edit_file replacements for small changes, and use write_file only for new files or deliberate full rewrites.\n\n")
+		TEXT("For .uasset content, use Unreal asset/editor tooling and do not treat binary assets as text files.\n");
+
+	if (!FFileHelper::SaveStringToFile(DefaultContent, *InstructionsPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	{
+		return FString::Printf(TEXT("Failed to create Copilot instructions at: %s"), *InstructionsPath);
+	}
+
+	if (BridgeService.IsValid())
+	{
+		BridgeService->ReloadInstructions();
+	}
+
+	return FString::Printf(TEXT("Created Copilot instructions at: %s\nUse /instructions reload after editing this file."), *InstructionsPath);
 }
 
 FString FGitHubCopilotUESlashCommands::HandleSession(const FString& Args)

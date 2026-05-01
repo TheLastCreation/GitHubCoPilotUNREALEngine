@@ -193,6 +193,12 @@ public:
 	/** Save auth + model selection to disk */
 	void SaveTokenCache();
 
+	/** Invalidate cached instruction files so the next request rebuilds the system prompt. */
+	void ReloadInstructions();
+
+	/** Human-readable summary of instruction files currently used in prompts. */
+	FString GetInstructionStatus() const;
+
 	// === Chat ===
 	/** Send a chat completion request to Copilot */
 	void SendRequest(const FCopilotRequest& Request);
@@ -248,6 +254,10 @@ private:
 	void SendChatCompletion(const FCopilotRequest& Request, bool bAllowToolCalls = true);
 	void OnChatCompletionResponse(FHttpRequestPtr HttpReq, FHttpResponsePtr HttpResp, bool bSuccess, FString RequestId, FString ConversationId);
 	FString BuildSystemPrompt(const FCopilotRequest& Request) const;
+	FString BuildInstructionBlock() const;
+	FString BuildDefaultToolInstructions() const;
+	FString GetProjectInstructionsPath() const;
+	void AddRequestDiagnosticsToResponse(FCopilotResponse& Response, const FString& RequestId, int32 RequestStatus) const;
 	FString CommandTypeToString(ECopilotCommandType Type) const;
 
 	void SetConnectionStatus(ECopilotConnectionStatus NewStatus);
@@ -286,9 +296,31 @@ private:
 	FString ReasoningEffort = TEXT("medium");
 
 	// Request tracking
+	struct FRequestDiagnostics
+	{
+		FString RequestedModel;
+		FString EndpointUrl;
+		FString EndpointPath;
+		bool bResponsesFormat = false;
+		bool bAllowToolCalls = false;
+		int32 ToolCount = 0;
+		int32 PayloadChars = 0;
+	};
+
 	TMap<FString, double> PendingRequestTimestamps;
 	TMap<FString, int32> NoResponseRetryCounts;
+	TMap<FString, FRequestDiagnostics> RequestDiagnostics;
 	TSet<FString> MaxCompletionTokenRequestIds;
+
+	// Instruction cache
+	mutable bool bInstructionCacheValid = false;
+	mutable FString CachedInstructionBlock;
+	mutable FDateTime CachedProjectInstructionTimestamp;
+	mutable bool bCachedProjectInstructionsExist = false;
+	mutable bool bCachedProjectInstructionsTruncated = false;
+	mutable int32 CachedInstructionBytes = 0;
+	mutable TArray<FString> CachedInstructionSources;
+	bool bRefreshSystemPromptOnNextRequest = false;
 
 	// Queued requests waiting for token refresh
 	TArray<TPair<FCopilotRequest, bool>> QueuedRequestsAwaitingToken;

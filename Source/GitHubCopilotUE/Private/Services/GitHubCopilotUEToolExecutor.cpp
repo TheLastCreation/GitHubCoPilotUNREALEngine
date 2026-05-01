@@ -2824,6 +2824,31 @@ TArray<TSharedPtr<FJsonValue>> FGitHubCopilotUEToolExecutor::BuildToolDefinition
 
 namespace
 {
+	static bool FindStaleTemplatePythonAssetRoot(const FString& Script, FString& OutMatchedRoot)
+	{
+		const FString ScriptLower = Script.ToLower();
+		const TArray<FString> StaleRoots = {
+			TEXT("/game/thirdperson"),
+			TEXT("/game/variant_combat"),
+			TEXT("/game/variant_platforming"),
+			TEXT("/game/variant_sidescrolling"),
+			TEXT("/game/input"),
+			TEXT("/game/characters"),
+			TEXT("/game/voxelworld")
+		};
+
+		for (const FString& Root : StaleRoots)
+		{
+			if (ScriptLower.Contains(Root))
+			{
+				OutMatchedRoot = Root;
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	static FString SanitizeAssetName(const FString& InName)
 	{
 		FString Name = InName.TrimStartAndEnd();
@@ -5226,8 +5251,19 @@ FString FGitHubCopilotUEToolExecutor::Tool_ExecutePython(const TSharedPtr<FJsonO
 	UE_LOG(LogGitHubCopilotUE, Log, TEXT("ToolExecutor: ExecutePython — script length=%d, timeout=%.0fs"),
 		Script.Len(), TimeoutSeconds);
 
+	FString MatchedStaleRoot;
+	if (FindStaleTemplatePythonAssetRoot(Script, MatchedStaleRoot))
+	{
+		UE_LOG(LogGitHubCopilotUE, Warning,
+			TEXT("ToolExecutor: Blocked execute_python script referencing stale template asset root '%s'."),
+			*MatchedStaleRoot);
+		return FString::Printf(
+			TEXT("Error: Python execution blocked because the script references stale template asset root '%s'. Use current Content/Project asset paths instead (for example /Game/Project/Levels, /Game/Project/Input, /Game/Project/Gameplay/Variants, or /Game/Project/Systems/VoxelWorld)."),
+			*MatchedStaleRoot);
+	}
+
 	// Ensure the temp directory exists
-	const FString TempDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("CopilotTemp"));
+	const FString TempDir = FPaths::ConvertRelativePathToFull(FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("CopilotTemp")));
 	IFileManager::Get().MakeDirectory(*TempDir, true);
 
 	// Generate unique file names
@@ -8424,7 +8460,7 @@ TArray<TSharedPtr<FJsonValue>> FGitHubCopilotUEToolExecutor::BuildToolDefinition
 		Params->SetArrayField(TEXT("required"), Req);
 		Params->SetBoolField(TEXT("additionalProperties"), false);
 		Tools.Add(MakeToolDef(TEXT("rg"),
-			TEXT("Search text across files (ripgrep-style alias routed to search_files)."),
+			TEXT("Search text across files before editing or when locating symbols. Prefer this over shell grep for source/context discovery."),
 			Params));
 	}
 
@@ -8442,7 +8478,7 @@ TArray<TSharedPtr<FJsonValue>> FGitHubCopilotUEToolExecutor::BuildToolDefinition
 		Params->SetArrayField(TEXT("required"), Req);
 		Params->SetBoolField(TEXT("additionalProperties"), false);
 		Tools.Add(MakeToolDef(TEXT("read_file"),
-			TEXT("Read the contents of a file. Returns the file content with line numbers. Use start_line/end_line for large files."),
+			TEXT("Read a text file before editing it. Returns line-numbered content. Use start_line/end_line for large files or focused context."),
 			Params));
 	}
 
@@ -8460,7 +8496,7 @@ TArray<TSharedPtr<FJsonValue>> FGitHubCopilotUEToolExecutor::BuildToolDefinition
 		Params->SetArrayField(TEXT("required"), Req);
 		Params->SetBoolField(TEXT("additionalProperties"), false);
 		Tools.Add(MakeToolDef(TEXT("write_file"),
-			TEXT("Write content to a file. Creates the file if it doesn't exist. Automatically backs up existing files before overwriting."),
+			TEXT("Write full content to a text file. Use primarily for new files or deliberate full-file rewrites after inspection. Existing files are backed up before overwrite."),
 			Params));
 	}
 
@@ -8480,7 +8516,7 @@ TArray<TSharedPtr<FJsonValue>> FGitHubCopilotUEToolExecutor::BuildToolDefinition
 		Params->SetArrayField(TEXT("required"), Req);
 		Params->SetBoolField(TEXT("additionalProperties"), false);
 		Tools.Add(MakeToolDef(TEXT("edit_file"),
-			TEXT("Edit a file by replacing an exact string match with new content. The old_str must appear exactly once in the file. Creates a backup before editing."),
+			TEXT("Edit a text file by replacing one exact string. Prefer this for surgical edits. old_str must include enough context to appear exactly once; re-read and retry if stale or duplicated. Creates a backup before editing."),
 			Params));
 	}
 

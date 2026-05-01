@@ -75,6 +75,7 @@ private:
 	FString HandleCopy(const FString& Args);
 	FString HandleContext(const FString& Args);
 	FString HandleModel(const FString& Args);
+	FString HandleModelDebug(const FString& Args);
 	FString HandleLogin(const FString& Args);
 	FString HandleLogout(const FString& Args);
 	FString HandleListDirs(const FString& Args);

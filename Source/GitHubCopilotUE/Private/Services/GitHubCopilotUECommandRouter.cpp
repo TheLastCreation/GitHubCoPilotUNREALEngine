@@ -896,7 +896,19 @@ FCopilotResponse FGitHubCopilotUECommandRouter::HandleOpenAsset(const FCopilotRe
 		if (GEditor)
 		{
 			TArray<UObject*> Assets;
-			UObject* Asset = AssetData.GetAsset();
+			const FString ResolvedObjectPath = AssetData.GetObjectPathString();
+			UObject* Asset = FindObject<UObject>(nullptr, *ResolvedObjectPath);
+			if (Asset == nullptr)
+			{
+				if (AssetData.AssetClassPath.ToString().Contains(TEXT("Blueprint")))
+				{
+					Response.ResultStatus = ECopilotResultStatus::Failure;
+					Response.ErrorMessage = FString::Printf(TEXT("Refusing to load unloaded Blueprint asset: %s. Open or repair the Blueprint in the editor first."), *AssetPath);
+					return Response;
+				}
+
+				Asset = LoadObject<UObject>(nullptr, *ResolvedObjectPath);
+			}
 			if (Asset)
 			{
 				Assets.Add(Asset);

@@ -95,6 +95,63 @@ namespace
 		return true;
 	}
 
+	static bool IsPathUnderAssetRoot(const FString& ObjectPath, const FString& Root)
+	{
+		const FString ObjectPathLower = ObjectPath.ToLower();
+		const FString RootLower = Root.ToLower();
+		return ObjectPathLower.Equals(RootLower) ||
+			ObjectPathLower.StartsWith(RootLower + TEXT("/")) ||
+			ObjectPathLower.StartsWith(RootLower + TEXT("."));
+	}
+
+	static bool FindStaleTemplateAssetRoot(const FString& ObjectPath, FString& OutMatchedRoot)
+	{
+		const TArray<FString> StaleRoots = {
+			TEXT("/Game/ThirdPerson"),
+			TEXT("/Game/Variant_Combat"),
+			TEXT("/Game/Variant_Platforming"),
+			TEXT("/Game/Variant_SideScrolling"),
+			TEXT("/Game/Input"),
+			TEXT("/Game/Characters"),
+			TEXT("/Game/VoxelWorld")
+		};
+
+		for (const FString& Root : StaleRoots)
+		{
+			if (IsPathUnderAssetRoot(ObjectPath, Root))
+			{
+				OutMatchedRoot = Root;
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	static FString MakeStaleTemplateAssetRootError(const FString& MatchedRoot)
+	{
+		return FString::Printf(
+			TEXT("Asset access blocked because '%s' is a stale template asset root. Use current Content/Project asset paths instead, such as /Game/Project/Levels, /Game/Project/Input, /Game/Project/Gameplay/Variants, or /Game/Project/Systems/VoxelWorld."),
+			*MatchedRoot);
+	}
+
+	static bool TryGetAssetDataForObjectPath(const FString& ObjectPath, FAssetData& OutAssetData)
+	{
+		FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		OutAssetData = AssetRegistryModule.Get().GetAssetByObjectPath(FSoftObjectPath(ObjectPath));
+		return OutAssetData.IsValid();
+	}
+
+	static bool IsBlueprintLikeAssetData(const FAssetData& AssetData)
+	{
+		return AssetData.AssetClassPath.ToString().Contains(TEXT("Blueprint"));
+	}
+
+	static bool IsObjectPathLoaded(const FString& ObjectPath)
+	{
+		return FindObject<UObject>(nullptr, *ObjectPath) != nullptr;
+	}
+
 	static bool IsSupportedProperty(const FProperty* Property)
 	{
 		if (Property == nullptr || Property->HasAnyPropertyFlags(CPF_Deprecated | CPF_Transient))
@@ -360,7 +417,45 @@ namespace
 			return nullptr;
 		}
 
-		UObject* LoadedObject = LoadObject<UObject>(nullptr, *ObjectPath);
+		FString MatchedStaleRoot;
+		if (FindStaleTemplateAssetRoot(ObjectPath, MatchedStaleRoot))
+		{
+			OutError = MakeStaleTemplateAssetRootError(MatchedStaleRoot);
+			return nullptr;
+		}
+
+		if (UObject* ExistingObject = FindObject<UObject>(nullptr, *ObjectPath))
+		{
+			if (ExpectedClass != nullptr && !ExistingObject->IsA(ExpectedClass))
+			{
+				OutError = FString::Printf(TEXT("Referenced asset '%s' is %s, expected %s"), *InObjectPath, *ExistingObject->GetClass()->GetName(), *ExpectedClass->GetName());
+				return nullptr;
+			}
+
+			return ExistingObject;
+		}
+
+		const FString AssetPath = FSoftObjectPath(ObjectPath).GetAssetPathString();
+		if (AssetPath.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("Referenced asset '%s' is not a top-level asset path. Open the owning asset in the editor before using nested object references."), *InObjectPath);
+			return nullptr;
+		}
+
+		FAssetData AssetData;
+		if (!TryGetAssetDataForObjectPath(AssetPath, AssetData))
+		{
+			OutError = FString::Printf(TEXT("Referenced asset '%s' is not loaded and was not found in the Asset Registry. Use a top-level Content Browser asset path or open the asset in the editor first."), *InObjectPath);
+			return nullptr;
+		}
+
+		if (AssetData.AssetClassPath.ToString() == TEXT("/Script/Engine.World"))
+		{
+			OutError = FString::Printf(TEXT("Referenced asset '%s' is a world/map asset. modify_asset does not support loading world assets through object-property assignment."), *InObjectPath);
+			return nullptr;
+		}
+
+		UObject* LoadedObject = LoadObject<UObject>(nullptr, *AssetPath);
 		if (LoadedObject == nullptr)
 		{
 			OutError = FString::Printf(TEXT("Failed to load referenced asset '%s'"), *InObjectPath);
@@ -374,6 +469,57 @@ namespace
 		}
 
 		return LoadedObject;
+	}
+
+	static UClass* ResolveClassReference(const FString& InClassPath, UClass* ExpectedBaseClass, FString& OutError)
+	{
+		FString ObjectPath;
+		if (!NormalizeObjectPath(InClassPath, ObjectPath, OutError))
+		{
+			return nullptr;
+		}
+
+		FString MatchedStaleRoot;
+		if (FindStaleTemplateAssetRoot(ObjectPath, MatchedStaleRoot))
+		{
+			OutError = MakeStaleTemplateAssetRootError(MatchedStaleRoot);
+			return nullptr;
+		}
+
+		if (UClass* ExistingClass = FindObject<UClass>(nullptr, *ObjectPath))
+		{
+			if (ExpectedBaseClass != nullptr && !ExistingClass->IsChildOf(ExpectedBaseClass))
+			{
+				OutError = FString::Printf(TEXT("Referenced class '%s' is %s, expected subclass of %s"), *InClassPath, *ExistingClass->GetName(), *ExpectedBaseClass->GetName());
+				return nullptr;
+			}
+
+			return ExistingClass;
+		}
+
+		FString ClassObjectPath = ObjectPath;
+		FAssetData AssetData;
+		if (TryGetAssetDataForObjectPath(ObjectPath, AssetData) && IsBlueprintLikeAssetData(AssetData))
+		{
+			const FString PackageName = FPackageName::ObjectPathToPackageName(ObjectPath);
+			const FString AssetName = FPackageName::ObjectPathToObjectName(ObjectPath);
+			ClassObjectPath = PackageName + TEXT(".") + AssetName + TEXT("_C");
+		}
+
+		UClass* LoadedClass = LoadObject<UClass>(nullptr, *ClassObjectPath);
+		if (LoadedClass == nullptr)
+		{
+			OutError = FString::Printf(TEXT("Failed to load referenced class '%s'"), *InClassPath);
+			return nullptr;
+		}
+
+		if (ExpectedBaseClass != nullptr && !LoadedClass->IsChildOf(ExpectedBaseClass))
+		{
+			OutError = FString::Printf(TEXT("Referenced class '%s' is %s, expected subclass of %s"), *InClassPath, *LoadedClass->GetName(), *ExpectedBaseClass->GetName());
+			return nullptr;
+		}
+
+		return LoadedClass;
 	}
 
 	static bool SetPropertyValueFromJson(FProperty* Property, void* ValuePtr, const TSharedPtr<FJsonValue>& JsonValue, FString& OutError)
@@ -477,6 +623,24 @@ namespace
 			}
 
 			SoftObjectProperty->SetPropertyValue(ValuePtr, FSoftObjectPtr(FSoftObjectPath(ObjectPath)));
+			return true;
+		}
+
+		if (FClassProperty* ClassProperty = CastField<FClassProperty>(Property))
+		{
+			if (JsonValue->IsNull())
+			{
+				ClassProperty->SetObjectPropertyValue(ValuePtr, nullptr);
+				return true;
+			}
+
+			UClass* ClassValue = ResolveClassReference(JsonValue->AsString(), ClassProperty->MetaClass, OutError);
+			if (ClassValue == nullptr)
+			{
+				return false;
+			}
+
+			ClassProperty->SetObjectPropertyValue(ValuePtr, ClassValue);
 			return true;
 		}
 
@@ -615,6 +779,31 @@ namespace
 		FJsonSerializer::Serialize(JsonObject.ToSharedRef(), Writer);
 		return Output;
 	}
+
+	static FString BuildAssetRegistryInspectionResult(const FAssetData& AssetData, const FString& ResolvedObjectPath, bool bBlueprintDefaults, const FString& SkipReason)
+	{
+		TSharedPtr<FJsonObject> ResultObject = MakeShared<FJsonObject>();
+		ResultObject->SetStringField(TEXT("resolved_object_path"), ResolvedObjectPath);
+		ResultObject->SetStringField(TEXT("target_kind"), bBlueprintDefaults ? TEXT("blueprint_defaults_registry") : TEXT("asset_registry"));
+		ResultObject->SetStringField(TEXT("package_name"), AssetData.PackageName.ToString());
+		ResultObject->SetStringField(TEXT("package_path"), AssetData.PackagePath.ToString());
+		ResultObject->SetStringField(TEXT("asset_name"), AssetData.AssetName.ToString());
+		ResultObject->SetStringField(TEXT("asset_class_path"), AssetData.AssetClassPath.ToString());
+		ResultObject->SetBoolField(TEXT("loaded"), false);
+		ResultObject->SetBoolField(TEXT("load_skipped"), true);
+		ResultObject->SetStringField(TEXT("skip_reason"), SkipReason);
+
+		TSharedPtr<FJsonObject> TagsObject = MakeShared<FJsonObject>();
+		AssetData.TagsAndValues.ForEach([TagsObject](TPair<FName, FAssetTagValueRef> Pair)
+		{
+			TagsObject->SetStringField(Pair.Key.ToString(), Pair.Value.GetValue());
+		});
+		ResultObject->SetObjectField(TEXT("tags"), TagsObject);
+
+		TArray<TSharedPtr<FJsonValue>> PropertyArray;
+		ResultObject->SetArrayField(TEXT("properties"), PropertyArray);
+		return SerializeJsonObject(ResultObject);
+	}
 }
 
 bool FGitHubCopilotUEAssetService::ResolveAssetTarget(
@@ -636,9 +825,28 @@ bool FGitHubCopilotUEAssetService::ResolveAssetTarget(
 		return false;
 	}
 
-	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-	FAssetData AssetData = AssetRegistryModule.Get().GetAssetByObjectPath(FSoftObjectPath(OutResolvedObjectPath));
-	OutRootAsset = AssetData.IsValid() ? AssetData.GetAsset() : LoadObject<UObject>(nullptr, *OutResolvedObjectPath);
+	FString MatchedStaleRoot;
+	if (FindStaleTemplateAssetRoot(OutResolvedObjectPath, MatchedStaleRoot))
+	{
+		OutError = MakeStaleTemplateAssetRootError(MatchedStaleRoot);
+		return false;
+	}
+
+	FAssetData AssetData;
+	const bool bHasAssetData = TryGetAssetDataForObjectPath(OutResolvedObjectPath, AssetData);
+	OutRootAsset = FindObject<UObject>(nullptr, *OutResolvedObjectPath);
+	if (OutRootAsset == nullptr)
+	{
+		if (bHasAssetData && IsBlueprintLikeAssetData(AssetData))
+		{
+			OutError = FString::Printf(
+				TEXT("Refusing to load unloaded Blueprint asset '%s' through this tool. inspect_asset can return Asset Registry metadata without loading it; open or repair the Blueprint in the editor before editing defaults."),
+				*OutResolvedObjectPath);
+			return false;
+		}
+
+		OutRootAsset = LoadObject<UObject>(nullptr, *OutResolvedObjectPath);
+	}
 	if (OutRootAsset == nullptr)
 	{
 		OutError = FString::Printf(TEXT("Asset not found: %s"), *OutResolvedObjectPath);
@@ -660,12 +868,7 @@ bool FGitHubCopilotUEAssetService::ResolveAssetTarget(
 
 	if (OutBlueprintAsset->GeneratedClass == nullptr)
 	{
-		FKismetEditorUtilities::CompileBlueprint(OutBlueprintAsset);
-	}
-
-	if (OutBlueprintAsset->GeneratedClass == nullptr)
-	{
-		OutError = FString::Printf(TEXT("Blueprint '%s' does not have a generated class to edit defaults on"), *OutResolvedObjectPath);
+		OutError = FString::Printf(TEXT("Blueprint '%s' does not have a generated class loaded. Compile or repair the Blueprint in the editor before editing defaults."), *OutResolvedObjectPath);
 		return false;
 	}
 
@@ -719,6 +922,51 @@ bool FGitHubCopilotUEAssetService::SaveAsset(UObject* RootAsset, UBlueprint* Blu
 
 bool FGitHubCopilotUEAssetService::InspectAsset(const FString& AssetPath, bool bBlueprintDefaults, FString& OutResult) const
 {
+	FString PreflightObjectPath;
+	FString PreflightError;
+	if (!NormalizeObjectPath(AssetPath, PreflightObjectPath, PreflightError))
+	{
+		OutResult = PreflightError;
+		return false;
+	}
+
+	FString MatchedStaleRoot;
+	if (FindStaleTemplateAssetRoot(PreflightObjectPath, MatchedStaleRoot))
+	{
+		OutResult = MakeStaleTemplateAssetRootError(MatchedStaleRoot);
+		return false;
+	}
+
+	FAssetData AssetData;
+	const bool bHasAssetData = TryGetAssetDataForObjectPath(PreflightObjectPath, AssetData);
+	const bool bIsLoaded = IsObjectPathLoaded(PreflightObjectPath);
+	if (!bHasAssetData && !bIsLoaded)
+	{
+		OutResult = FString::Printf(
+			TEXT("Asset '%s' is not loaded and was not found in the Asset Registry. inspect_asset only supports loaded objects or top-level asset paths recognized by the Content Browser; open the asset in the editor first or inspect the top-level asset path instead."),
+			*PreflightObjectPath);
+		return false;
+	}
+
+	if (bHasAssetData && !bIsLoaded)
+	{
+		if (bBlueprintDefaults && !IsBlueprintLikeAssetData(AssetData))
+		{
+			OutResult = FString::Printf(
+				TEXT("Asset '%s' is %s. blueprint_defaults=true requires a Blueprint asset."),
+				*PreflightObjectPath,
+				*AssetData.AssetClassPath.ToString());
+			return false;
+		}
+
+		OutResult = BuildAssetRegistryInspectionResult(
+			AssetData,
+			PreflightObjectPath,
+			bBlueprintDefaults,
+			TEXT("Asset is not loaded; returning Asset Registry metadata to avoid loading packages during inspect_asset."));
+		return true;
+	}
+
 	UObject* RootAsset = nullptr;
 	UObject* TargetObject = nullptr;
 	UBlueprint* BlueprintAsset = nullptr;
