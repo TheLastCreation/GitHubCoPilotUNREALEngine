@@ -6,6 +6,7 @@
 #include "Editor.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
+#include "Engine/World.h"
 #include "InputAction.h"
 #include "InputCoreTypes.h"
 #include "InputMappingContext.h"
@@ -150,6 +151,30 @@ namespace
 	static bool IsObjectPathLoaded(const FString& ObjectPath)
 	{
 		return FindObject<UObject>(nullptr, *ObjectPath) != nullptr;
+	}
+
+	static bool IsWorldOrLevelObject(const UObject* Object)
+	{
+		return Object != nullptr && (Object->IsA<UWorld>() || Object->GetTypedOuter<UWorld>() != nullptr);
+	}
+
+	static UObject* FindPackageSaveRoot(UObject* Object)
+	{
+		if (Object == nullptr)
+		{
+			return nullptr;
+		}
+
+		UPackage* Package = Object->GetOutermost();
+		for (UObject* Current = Object; Current != nullptr && Current != Package; Current = Current->GetOuter())
+		{
+			if (Current->HasAnyFlags(RF_Public | RF_Standalone))
+			{
+				return Current;
+			}
+		}
+
+		return nullptr;
 	}
 
 	static bool IsSupportedProperty(const FProperty* Property)
@@ -501,8 +526,14 @@ namespace
 		FAssetData AssetData;
 		if (TryGetAssetDataForObjectPath(ObjectPath, AssetData) && IsBlueprintLikeAssetData(AssetData))
 		{
-			const FString PackageName = FPackageName::ObjectPathToPackageName(ObjectPath);
-			const FString AssetName = FPackageName::ObjectPathToObjectName(ObjectPath);
+			const FString PackageName = AssetData.PackageName.ToString();
+			const FString AssetName = AssetData.AssetName.ToString();
+			if (PackageName.IsEmpty() || AssetName.IsEmpty())
+			{
+				OutError = FString::Printf(TEXT("Referenced class '%s' resolved to invalid Blueprint asset metadata"), *InClassPath);
+				return nullptr;
+			}
+
 			ClassObjectPath = PackageName + TEXT(".") + AssetName + TEXT("_C");
 		}
 
@@ -884,6 +915,8 @@ bool FGitHubCopilotUEAssetService::ResolveAssetTarget(
 
 bool FGitHubCopilotUEAssetService::SaveAsset(UObject* RootAsset, UBlueprint* BlueprintAsset, FString& OutError) const
 {
+	OutError.Reset();
+
 	if (RootAsset == nullptr)
 	{
 		OutError = TEXT("Cannot save a null asset");
@@ -896,7 +929,7 @@ bool FGitHubCopilotUEAssetService::SaveAsset(UObject* RootAsset, UBlueprint* Blu
 	}
 
 	RootAsset->MarkPackageDirty();
-	UPackage* Package = RootAsset->GetPackage();
+	UPackage* Package = RootAsset->GetOutermost();
 	if (Package == nullptr)
 	{
 		OutError = TEXT("Asset package is null");
@@ -904,6 +937,23 @@ bool FGitHubCopilotUEAssetService::SaveAsset(UObject* RootAsset, UBlueprint* Blu
 	}
 
 	Package->MarkPackageDirty();
+
+	if (IsWorldOrLevelObject(RootAsset))
+	{
+		OutError = TEXT("Level/world package was marked dirty but not auto-saved by modify_asset. Save the level from the editor; this avoids Unreal's RF_Standalone data-loss guard for map subobjects such as WorldSettings.");
+		return true;
+	}
+
+	UObject* SaveRoot = BlueprintAsset != nullptr ? BlueprintAsset : FindPackageSaveRoot(RootAsset);
+	if (SaveRoot == nullptr)
+	{
+		OutError = FString::Printf(
+			TEXT("Object '%s' was marked dirty but not auto-saved because it is not a top-level asset with RF_Public or RF_Standalone. Use the top-level asset path when saving through modify_asset."),
+			*RootAsset->GetPathName());
+		return true;
+	}
+
+	SaveRoot->MarkPackageDirty();
 	const FString PackageFilename = FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension());
 
 	FSavePackageArgs SaveArgs;
@@ -911,7 +961,7 @@ bool FGitHubCopilotUEAssetService::SaveAsset(UObject* RootAsset, UBlueprint* Blu
 	SaveArgs.SaveFlags = SAVE_None;
 	SaveArgs.bSlowTask = false;
 
-	if (!UPackage::SavePackage(Package, RootAsset, *PackageFilename, SaveArgs))
+	if (!UPackage::SavePackage(Package, SaveRoot, *PackageFilename, SaveArgs))
 	{
 		OutError = FString::Printf(TEXT("Failed to save package '%s'"), *PackageFilename);
 		return false;
@@ -1198,6 +1248,10 @@ bool FGitHubCopilotUEAssetService::ModifyAsset(const FString& AssetPath, bool bB
 	{
 		OutResult = Error;
 		return false;
+	}
+	if (!Error.IsEmpty())
+	{
+		AppliedMessages.Add(Error);
 	}
 
 	FString Message = FString::Printf(TEXT("Modified %s (%s)"), *ResolvedObjectPath, bBlueprintDefaults ? TEXT("blueprint defaults") : TEXT("asset instance"));

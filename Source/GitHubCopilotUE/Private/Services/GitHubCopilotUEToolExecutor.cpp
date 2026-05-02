@@ -8860,7 +8860,7 @@ TArray<TSharedPtr<FJsonValue>> FGitHubCopilotUEToolExecutor::BuildToolDefinition
 		Params->SetArrayField(TEXT("required"), Req);
 		Params->SetBoolField(TEXT("additionalProperties"), false);
 		Tools.Add(MakeToolDef(TEXT("modify_asset"),
-			TEXT("Modify an Unreal asset or Blueprint defaults target through Unreal editor APIs. Supports generic reflected property edits and an Enhanced Input add_mapping operation for Input Mapping Context assets."),
+			TEXT("Modify an Unreal asset or Blueprint defaults target through Unreal editor APIs. Supports generic reflected property edits and Enhanced Input add_mapping. Level/world objects are marked dirty but not auto-saved; save levels from the editor."),
 			Params));
 	}
 
