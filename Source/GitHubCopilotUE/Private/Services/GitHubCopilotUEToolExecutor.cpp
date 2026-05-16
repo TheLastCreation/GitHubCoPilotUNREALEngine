@@ -2824,8 +2824,18 @@ TArray<TSharedPtr<FJsonValue>> FGitHubCopilotUEToolExecutor::BuildToolDefinition
 
 namespace
 {
+	static bool UsesProjectContentTaxonomy()
+	{
+		return IFileManager::Get().DirectoryExists(*(FPaths::ProjectContentDir() / TEXT("Project")));
+	}
+
 	static bool FindStaleTemplatePythonAssetRoot(const FString& Script, FString& OutMatchedRoot)
 	{
+		if (!UsesProjectContentTaxonomy())
+		{
+			return false;
+		}
+
 		const FString ScriptLower = Script.ToLower();
 		const TArray<FString> StaleRoots = {
 			TEXT("/game/thirdperson"),

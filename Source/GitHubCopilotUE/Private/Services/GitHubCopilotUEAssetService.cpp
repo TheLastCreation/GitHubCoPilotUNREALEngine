@@ -105,8 +105,18 @@ namespace
 			ObjectPathLower.StartsWith(RootLower + TEXT("."));
 	}
 
+	static bool UsesProjectContentTaxonomy()
+	{
+		return IFileManager::Get().DirectoryExists(*(FPaths::ProjectContentDir() / TEXT("Project")));
+	}
+
 	static bool FindStaleTemplateAssetRoot(const FString& ObjectPath, FString& OutMatchedRoot)
 	{
+		if (!UsesProjectContentTaxonomy())
+		{
+			return false;
+		}
+
 		const TArray<FString> StaleRoots = {
 			TEXT("/Game/ThirdPerson"),
 			TEXT("/Game/Variant_Combat"),
